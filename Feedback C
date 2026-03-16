@@ -1,0 +1,81 @@
+**Overall Assessment**  
+Your Axiom architecture document is exceptionally well-structured, coherent, and forward-thinking (solid **8.5/10**). It directly tackles the two biggest failure modes of current AI coding agents — the “misinterpretation loop” from mid-execution corrections and context-overload hallucinations — with an elegant, enforceable solution (single-prompt → immutable SRS → strict minimal-context workers).  
+
+The defense-in-depth security model, budget-aware orchestration, disposable agents, multi-gate approval pipeline, and local-first constraints (Docker + BitNet) are production-grade ideas. The technology choices are realistic for 2026:  
+- Microsoft **bitnet.cpp** (official 1-bit inference framework) + Falcon3 1.58-bit models already exist and deliver exactly the “free, fast, trivial-task” tier you describe.  
+- OpenClaw / NanoClaw (the viral open-source personal AI assistant with Docker sandboxing) is the perfect real-world counterpart for your Claw orchestrator integration.  
+
+No fundamental showstoppers. With the clarifications and small additions below, this becomes a genuinely shippable blueprint.
+
+### Strengths (What You Got Right)
+- Immutable SRS + approval gate eliminates the misinterpretation loop better than any existing agent system I’ve seen.
+- Minimal-context workers + disposable containers + TaskSpec/ReviewSpec templates are the cleanest antidote to hallucination I’ve reviewed.
+- Hierarchical task tree + traceability to SRS requirements + git branch isolation gives auditability and safety.
+- Budget ceiling + tiered model routing + BitNet for trivial work is genuinely novel and user-friendly.
+- Claw API + Cloudflare Tunnel + skill-injection system makes the whole thing controllable from Discord/Telegram/WhatsApp without exposing keys.
+- Crash-recovery, state reconciliation, and orphan cleanup are thorough.
+
+### Critical Issues (Fix Before Coding)
+These are the only items that could cause real breakage or security holes.
+
+1. **Sub-Orchestrator Spawning & Nesting Ambiguity**  
+   The doc says sub-orchestrators run in Docker containers *and* “spawn and manage worker and reviewer containers.” This implies either Docker-in-Docker (heavy, insecure) or that the AI must directly call `docker run`.  
+   **Fix**: Explicitly state that *every* container spawn (worker, reviewer, sub-orchestrator) is performed *exclusively* by the Go Axiom core engine via the internal API. Sub-orchestrators (even when containerized) only issue high-level requests (“spawn worker for task X with this TaskSpec”) through the host API. Add this sentence to Section 7.2 and Section 10.6.
+
+2. **Orchestrator vs. Axiom Core Engine Boundary**  
+   The document repeatedly says “the orchestrator … writes approved files to the project filesystem” and has full FS access. But when the orchestrator is an external Claw (or Claude Code), it cannot have direct FS access.  
+   **Fix**: Add a new subsection 6.6 “Orchestrator–Engine Contract” clarifying that the AI orchestrator *never* touches the filesystem or Docker directly. It only calls the Axiom API (or internal Go functions when running as host process). The Go engine enforces every rule (no SRS modification, minimal context, budget checks, etc.) and performs all FS writes after the approval pipeline.
+
+3. **Dockerfile Language Support Incomplete**  
+   The example image starts from `node:22-slim` + `build-essential` but claims “Go, Python, Node.js available by default.” Go and Python are missing.  
+   **Fix**: Either (a) expand the Dockerfile with proper runtimes (`golang`, `python3`, `pip`, etc.) or (b) switch to a multi-stage / language-pack model (e.g., `mcr.microsoft.com/devcontainers` style or your own `axiom-worker-go`, `axiom-worker-python` images). Add a note that users can supply custom images via config.
+
+4. **Missing Docker Resource Limits**  
+   Default concurrency = 10 containers + BitNet server can easily OOM or thrash a consumer laptop.  
+   **Fix**: Add to `.axiom/config.toml` and Docker run commands:  
+   ```toml
+   [docker]
+   cpu_limit = 0.5   # cores per container
+   mem_limit = "2g"
+   ```  
+   Expose in GUI and `axiom status`.
+
+### Significant Gaps (Add These Sections)
+These are missing capabilities that will bite you in real projects.
+
+- **Structured Output Manifest** (new requirement in TaskSpec & ReviewSpec)  
+  Workers must also emit `/workspace/staging/manifest.json` describing `{ "added": [], "modified": [], "deleted": [], "renamed": [] }`. File Router uses this to handle deletions, renames, and early conflict detection. Without it, file deletions and moves become impossible.
+
+- **Dedicated Testing & Security Tasks**  
+  Add to SRS format: a mandatory “Test Strategy” section and auto-generated “test-generation” tasks. Also add optional “security-scan” tasks (trivy, gosec, etc.) in the approval pipeline.
+
+- **Observability & Prompt Logging (opt-in)**  
+  Add a config flag to capture full worker/reviewer prompts + responses (stored in `.axiom/logs/` with token counts). Invaluable for debugging why a task failed three times. Default: off for privacy.
+
+- **Model Performance History**  
+  Extend the Model Registry table with `historical_success_rate` and `avg_cost_per_task_type` columns. After every project, the engine updates these so future routing prefers models that worked well on *your* codebase style.
+
+- **File Deletion / Rename / Move Support**  
+  Covered by the manifest above.
+
+- **Best-Practices Guide** (new appendix or `axiom doctor --guide`)  
+  Users will struggle with writing good initial prompts and reviewing SRS. Provide examples and checklists.
+
+### Risks & Mitigations
+| Risk | Likelihood | Mitigation Already in Doc | Additional Recommendation |
+|------|------------|---------------------------|---------------------------|
+| AI orchestrator (Claw) drifts and modifies SRS | Medium | Skill injection + immutable file permissions | Go engine must reject any API call that attempts SRS modification |
+| SQLite contention under 10 concurrent workers + IPC polling | Medium | Single DB file | Enable WAL mode + add connection pooling in Go core |
+| Integration-check overhead on large projects | High for big trees | Per-task commit | Add optional “batch mode” flag for non-critical subtrees |
+| Agent breakout (cheap/local model) | Low | Docker + no project mount | Future-proof: pluggable sandbox backend (gVisor or Kata Containers) as opt-in |
+| Resource exhaustion on modest hardware | High | Budget & concurrency limits | Per-container limits + GUI warnings when >70% RAM/CPU |
+
+### Minor Polish Items
+- Add `task_output_manifest` to IPC message types.
+- Document that the credential proxy must also support BitNet fallback (if OpenRouter is down).
+- In Section 10.2, mention image versioning and optional vulnerability scanning (`trivy` on build).
+- Consider adding an “Extensibility Hooks” section: custom validators, custom reviewer prompts, plugin system for new languages.
+
+### Final Verdict & Next Steps
+This is one of the cleanest AI-agent architectures I’ve reviewed. The core philosophy is genuinely innovative and the security/cost controls are excellent. Implement the four critical fixes and the five gaps above (especially the output manifest and orchestrator/engine boundary clarification), and you’ll have a system that can actually ship reliable code from a single prompt without the usual AI chaos.
+
