@@ -1,8 +1,8 @@
 # Axiom — Software Architecture Document
 
-**Version:** 1.0
-**Date:** 2026-03-15
-**Status:** Approved
+**Version:** 2.0
+**Date:** 2026-03-16
+**Status:** Revised — Incorporating External Review Feedback
 
 ---
 
@@ -11,28 +11,34 @@
 1. [Overview](#1-overview)
 2. [Design Principles](#2-design-principles)
 3. [System Architecture](#3-system-architecture)
-4. [Core Flow](#4-core-flow)
-5. [Software Requirements Specification (SRS) Format](#5-software-requirements-specification-srs-format)
-6. [Orchestrator](#6-orchestrator)
-7. [Sub-Orchestrators](#7-sub-orchestrators)
-8. [Workers](#8-workers)
-9. [Reviewers](#9-reviewers)
-10. [Docker Sandbox Architecture](#10-docker-sandbox-architecture)
-11. [File Router & Approval Pipeline](#11-file-router--approval-pipeline)
-12. [Task System](#12-task-system)
-13. [Model Registry](#13-model-registry)
-14. [BitNet Local Inference](#14-bitnet-local-inference)
-15. [Communication Model](#15-communication-model)
-16. [Budget & Cost Management](#16-budget--cost-management)
-17. [State Management & Crash Recovery](#17-state-management--crash-recovery)
-18. [Git Integration](#18-git-integration)
-19. [Claw Integration](#19-claw-integration)
-20. [Skill System](#20-skill-system)
-21. [GUI Dashboard](#21-gui-dashboard)
-22. [CLI Reference](#22-cli-reference)
-23. [Project Directory Structure](#23-project-directory-structure)
-24. [Security Model](#24-security-model)
-25. [Error Handling & Escalation](#25-error-handling--escalation)
+4. [Trusted Engine vs. Untrusted Agent Plane](#4-trusted-engine-vs-untrusted-agent-plane)
+5. [Core Flow](#5-core-flow)
+6. [Software Requirements Specification (SRS) Format](#6-software-requirements-specification-srs-format)
+7. [Engineering Change Orders (ECO)](#7-engineering-change-orders-eco)
+8. [Orchestrator](#8-orchestrator)
+9. [Sub-Orchestrators](#9-sub-orchestrators)
+10. [Meeseeks (Workers)](#10-meeseeks-workers)
+11. [Reviewers](#11-reviewers)
+12. [Docker Sandbox Architecture](#12-docker-sandbox-architecture)
+13. [Validation Sandbox](#13-validation-sandbox)
+14. [File Router & Approval Pipeline](#14-file-router--approval-pipeline)
+15. [Task System](#15-task-system)
+16. [Concurrency, Snapshots & Merge Queue](#16-concurrency-snapshots--merge-queue)
+17. [Semantic Indexer](#17-semantic-indexer)
+18. [Model Registry](#18-model-registry)
+19. [BitNet Local Inference](#19-bitnet-local-inference)
+20. [Communication Model](#20-communication-model)
+21. [Budget & Cost Management](#21-budget--cost-management)
+22. [State Management & Crash Recovery](#22-state-management--crash-recovery)
+23. [Git Integration](#23-git-integration)
+24. [Claw Integration](#24-claw-integration)
+25. [Skill System](#25-skill-system)
+26. [GUI Dashboard](#26-gui-dashboard)
+27. [CLI Reference](#27-cli-reference)
+28. [Project Directory Structure](#28-project-directory-structure)
+29. [Security Model](#29-security-model)
+30. [Error Handling & Escalation](#30-error-handling--escalation)
+31. [Observability & Prompt Logging](#31-observability--prompt-logging)
 
 ---
 
@@ -40,55 +46,81 @@
 
 ### 1.1 Purpose
 
-Axiom is a local, software-development-focused AI agent orchestration platform. It coordinates multiple AI agents — running in isolated Docker containers — to autonomously build software from a single user prompt.
+Axiom is a software-development-focused AI agent orchestration platform. It coordinates multiple AI agents — running in isolated Docker containers — to autonomously build software from a single user prompt.
 
 ### 1.2 Core Philosophy
 
 Axiom is built on two foundational insights:
 
-1. **The Misinterpretation Loop:** When users correct AI agents mid-execution, agents blend contradictory instructions rather than cleanly replacing them. Axiom eliminates this by enforcing a single-prompt → SRS → approval → autonomous execution flow. Once the SRS is accepted, scope is immutable.
+1. **The Misinterpretation Loop:** When users correct AI agents mid-execution, agents blend contradictory instructions rather than cleanly replacing them. Axiom eliminates this by enforcing a single-prompt → SRS → approval → autonomous execution flow. Once the SRS is accepted, scope is immutable. Functional environmental changes (dead APIs, broken dependencies) are handled through a controlled Engineering Change Order (ECO) process, not scope modifications.
 
-2. **Context Overload & Hallucination:** As AI agents accumulate context about a project, they begin hallucinating references to nonexistent code, APIs, and files. Axiom prevents this by isolating workers with minimal context — each worker receives only what it needs to complete its specific task, nothing more.
+2. **Context Overload & Hallucination:** As AI agents accumulate context about a project, they begin hallucinating references to nonexistent code, APIs, and files. Axiom prevents this by giving workers ("Meeseeks") the minimum necessary structured context for their specific task — determined by the orchestrator — and destroying them immediately after task completion.
 
 ### 1.3 Scope
 
 Axiom is software-development-specific. While its primitives (tasks, agents, containers) are generic, the system is optimized for code generation workflows: SRS generation, task decomposition, code writing, automated validation, code review, and git integration.
 
-### 1.4 Technology Stack
+### 1.4 Naming Convention
+
+Worker agents in Axiom are called **Meeseeks** (inspired by Rick and Morty's Mr. Meeseeks). Like their namesake, Meeseeks exist for a single purpose: complete one task, then cease to exist. This naming reinforces the core architectural principle that worker agents are disposable, single-task entities that are created, execute, and are destroyed. They do not persist between tasks.
+
+### 1.5 Technology Stack
 
 | Component | Technology |
 |---|---|
-| Core engine | Go |
-| State store | SQLite |
-| Worker isolation | Docker |
+| Core engine (Trusted Control Plane) | Go |
+| State store | SQLite (WAL mode) |
+| Meeseeks isolation | Docker |
+| Validation sandbox | Docker (separate container class) |
 | Local inference | BitNet + Falcon3 |
 | Cloud inference | OpenRouter API |
 | GUI framework | Wails v2 (Go + React) |
+| Semantic indexer | tree-sitter |
 | Claw integration | REST API + WebSocket + Cloudflare Tunnel |
 
 ---
 
 ## 2. Design Principles
 
-### 2.1 Immutable Scope
+### 2.1 Immutable Scope with Controlled Change
 
-Once a user accepts the SRS, the project scope SHALL NOT be modified. The user MAY pause or cancel execution, but SHALL NOT alter requirements mid-run. This is the core mechanism that prevents the misinterpretation loop.
+Once a user accepts the SRS, the project scope SHALL NOT be modified. The user MAY pause or cancel execution, but SHALL NOT alter requirements mid-run.
 
-### 2.2 Minimal Context Workers
+When external environmental realities require adaptation (dead API, broken dependency, security vulnerability), the orchestrator MAY propose an Engineering Change Order (ECO) through a controlled, auditable process (see Section 7). ECOs are strictly limited to functional/environmental changes — they SHALL NOT alter the fundamental scope or feature set of the project.
 
-Workers SHALL receive the minimum context required to complete their assigned task. Workers SHALL NOT have access to the project filesystem, other workers' output, the full SRS, or any information beyond their TaskSpec. The orchestrator SHALL determine the appropriate context level for each task.
+### 2.2 Minimum Necessary Structured Context
 
-### 2.3 100% Local Execution
+Meeseeks SHALL receive the minimum necessary structured context required to complete their assigned task. The orchestrator SHALL determine the appropriate context level for each task. Context SHALL be structured and queryable, not raw unfiltered project dumps.
 
-All computation, state, and data SHALL remain on the user's machine. Axiom SHALL NOT transmit project data to any service other than the user-configured AI model providers (OpenRouter, BitNet). Axiom SHALL collect zero telemetry.
+Context tiers available to the orchestrator:
 
-### 2.4 Disposable Agents
+| Tier | Description | Use Case |
+|---|---|---|
+| **Symbol-level** | Specific function signatures, type definitions, constants | Simple implementations against known interfaces |
+| **File-level** | Complete relevant source files | Modifications to existing code |
+| **Package-level** | Full package/module with internal dependencies | Refactoring, cross-file changes |
+| **Repo map** | Dependency graph, directory structure, export index | Architectural tasks requiring broad awareness |
+| **Indexed query** | Query the semantic index for specific symbols/patterns | Dynamic context discovery |
 
-Every worker and reviewer SHALL be destroyed after completing its task. No agent persists between tasks. This ensures clean context boundaries and prevents state leakage between tasks.
+The orchestrator SHALL select the minimum tier sufficient for the task. Lower tiers are preferred.
+
+### 2.3 Local Control Plane with External Inference
+
+The Axiom control plane (Go engine, SQLite, Docker management, git, filesystem) SHALL execute entirely on the user's machine. No project data SHALL be transmitted to any service other than the user-configured AI model providers (OpenRouter, BitNet). Axiom SHALL collect zero telemetry.
+
+Model inference MAY use external providers (OpenRouter) or local providers (BitNet). The user controls which providers are enabled and which models are available.
+
+### 2.4 Disposable Agents (Meeseeks Principle)
+
+Every Meeseeks and reviewer SHALL be destroyed after completing its task. No agent persists between tasks. This ensures clean context boundaries and prevents state leakage between tasks.
 
 ### 2.5 Budget-Aware Orchestration
 
 The orchestrator SHALL respect the user-defined budget ceiling at all times. Model selection, concurrency level, and retry strategies SHALL be informed by remaining budget. The system SHALL NOT exceed the budget without explicit user authorization.
+
+### 2.6 Engine Authority
+
+All privileged operations (filesystem writes, git commits, container spawning, budget enforcement, model access) SHALL be performed exclusively by the Trusted Engine. LLM agents (orchestrator, sub-orchestrators, Meeseeks, reviewers) SHALL propose actions through structured requests. The engine SHALL validate, authorize, and execute those actions. No LLM agent SHALL directly perform any privileged operation.
 
 ---
 
@@ -97,81 +129,130 @@ The orchestrator SHALL respect the user-defined budget ceiling at all times. Mod
 ### 3.1 High-Level Diagram
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                         USER                              │
-│              (CLI / GUI / Claw Chat)                      │
-└────────────────────────┬─────────────────────────────────┘
-                         │ prompt
-                         ▼
-┌──────────────────────────────────────────────────────────┐
-│                    ORCHESTRATOR                           │
-│          (Claw / Claude Code / Codex / OpenCode)          │
-│                                                           │
-│  • Generates SRS from user prompt                         │
-│  • Receives user approval on SRS                          │
-│  • Decomposes SRS into hierarchical task tree              │
-│  • Routes tasks to workers by complexity tier              │
-│  • Spawns sub-orchestrators for subtrees                  │
-│  • Performs final validation of worker output              │
-│  • Commits approved changes to project branch             │
-│  • Manages budget allocation across tasks                 │
-└────┬──────────────┬──────────────┬───────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                           USER                                │
+│                (CLI / GUI / Claw Chat)                         │
+└──────────────────────────┬───────────────────────────────────┘
+                           │ prompt
+                           ▼
+┌──────────────────────────────────────────────────────────────┐
+│                 TRUSTED ENGINE (Go Control Plane)              │
+│                                                                │
+│  ┌─────────┐ ┌─────────┐ ┌──────────┐ ┌───────────────────┐  │
+│  │ SQLite  │ │  Git    │ │  File    │ │  Container        │  │
+│  │ State   │ │ Manager │ │  Router  │ │  Lifecycle Mgr    │  │
+│  └─────────┘ └─────────┘ └──────────┘ └───────────────────┘  │
+│  ┌─────────┐ ┌─────────┐ ┌──────────┐ ┌───────────────────┐  │
+│  │ Budget  │ │Semantic │ │  Model   │ │  Inference        │  │
+│  │ Enforcer│ │ Indexer │ │ Registry │ │  Broker           │  │
+│  └─────────┘ └─────────┘ └──────────┘ └───────────────────┘  │
+│  ┌─────────┐ ┌─────────┐ ┌──────────┐ ┌───────────────────┐  │
+│  │  API    │ │ Merge   │ │  ECO     │ │  Event            │  │
+│  │ Server  │ │ Queue   │ │ Manager  │ │  Emitter          │  │
+│  └─────────┘ └─────────┘ └──────────┘ └───────────────────┘  │
+└────┬──────────────┬──────────────┬───────────────────────────┘
      │              │              │
      ▼              ▼              ▼
-┌──────────┐ ┌──────────┐ ┌───────────────┐
-│ Worker A │ │ Worker B │ │Sub-Orchestr.  │
-│ (Docker) │ │ (Docker) │ │   (Docker)    │
-│ OpenRtr  │ │ BitNet   │ │               │
-│ Sonnet   │ │ Falcon3  │ │  ┌────┐┌────┐ │
-│          │ │          │ │  │ W  ││ W  │ │
-└────┬─────┘ └────┬─────┘ │  └────┘└────┘ │
-     │            │        └──────┬────────┘
-     ▼            ▼               ▼
-┌──────────────────────────────────────────────────────────┐
-│              FILE ROUTER / APPROVAL PIPELINE              │
-│  • Receives staged output from worker containers          │
-│  • Runs automated validation (compile, lint, test)        │
-│  • Routes to reviewer container for code review           │
-│  • Routes to orchestrator for final validation            │
-│  • Writes approved files to project filesystem            │
-└────────────────────────┬─────────────────────────────────┘
-                         ▼
-┌──────────────────────────────────────────────────────────┐
-│                  PROJECT FILESYSTEM                       │
-│  .axiom/          (SQLite DB, config, SRS)                │
-│  src/             (project source code)                   │
-│  ...                                                      │
-└──────────────────────────────────────────────────────────┘
+┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
+│              UNTRUSTED AGENT PLANE (all in Docker)            │
+│                                                               │
+│  ┌──────────────┐  ┌──────────────┐  ┌───────────────────┐  │
+│  │ Orchestrator │  │  Meeseeks A  │  │ Sub-Orchestrator  │  │
+│  │   (Docker)   │  │   (Docker)   │  │    (Docker)       │  │
+│  │  Claw/CC/etc │  │  OpenRouter  │  │   OpenRouter      │  │
+│  └──────────────┘  └──────────────┘  └───────────────────┘  │
+│  ┌──────────────┐  ┌──────────────┐  ┌───────────────────┐  │
+│  │ Meeseeks B   │  │  Reviewer    │  │ Validation        │  │
+│  │  (Docker)    │  │  (Docker)    │  │  Sandbox          │  │
+│  │  BitNet      │  │  OpenRouter  │  │  (Docker)         │  │
+│  └──────────────┘  └──────────────┘  └───────────────────┘  │
+└ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
 
-HOST SERVICES (outside containers):
+HOST SERVICES (managed by Trusted Engine):
 ┌────────────────┐  ┌────────────────┐  ┌────────────────┐
-│ BitNet Server  │  │ Credential     │  │ Axiom API      │
-│ :3002          │  │ Proxy :3001    │  │ Server :3000   │
-│ Falcon3 1-bit  │  │ API keys       │  │ (for Claws)    │
+│ BitNet Server  │  │ Inference      │  │ Axiom API      │
+│ :3002          │  │ Broker :3001   │  │ Server :3000   │
+│ Falcon3 1-bit  │  │ (replaces      │  │ (for Claws)    │
+│                │  │  cred proxy)   │  │                │
 └────────────────┘  └────────────────┘  └────────────────┘
 ```
 
 ### 3.2 Component Summary
 
-| Component | Responsibility |
-|---|---|
-| **Axiom Core Engine** | CLI commands, container lifecycle, file routing, API server, task management, cost tracking |
-| **Orchestrator** | SRS generation, task decomposition, model routing, final validation, git commits |
-| **Sub-Orchestrator** | Manages a subtree of tasks delegated by the orchestrator |
-| **Worker** | Executes a single TaskSpec inside a Docker container |
-| **Reviewer** | Evaluates worker output against the TaskSpec inside a Docker container |
-| **File Router** | Brokers files from container staging to project filesystem via approval pipeline |
-| **Model Registry** | Unified catalog of available models (OpenRouter + BitNet) with capabilities and pricing |
-| **BitNet Server** | Host-side local inference server for trivial tasks |
-| **Credential Proxy** | Host-side proxy that injects API keys into container requests |
-| **Axiom API Server** | REST + WebSocket server for Claw-based orchestrators |
-| **GUI Dashboard** | Wails desktop app for project visualization and control |
+| Component | Layer | Responsibility |
+|---|---|---|
+| **Trusted Engine** | Control Plane | All privileged operations: state management, git, filesystem, container lifecycle, budget enforcement, inference brokering, merge queue, event emission |
+| **Inference Broker** | Control Plane | Mediates ALL model API calls. Containers submit inference requests via IPC; broker executes with proper credentials, model allowlists, token caps, and audit logging |
+| **Semantic Indexer** | Control Plane | Maintains symbol/export/interface index of project code via tree-sitter. Queried by engine to build TaskSpecs |
+| **Merge Queue** | Control Plane | Serializes commits to prevent stale-context conflicts |
+| **Validation Sandbox** | Untrusted | Isolated Docker container for running compilation, linting, and tests against untrusted Meeseeks output |
+| **Orchestrator** | Untrusted | LLM agent that generates SRS, decomposes tasks, selects models, validates output. Proposes actions; engine executes |
+| **Sub-Orchestrator** | Untrusted | Manages a delegated subtree. Proposes actions; engine executes |
+| **Meeseeks** | Untrusted | Disposable agent that executes a single TaskSpec |
+| **Reviewer** | Untrusted | Disposable agent that evaluates Meeseeks output |
+| **GUI Dashboard** | Control Plane | Wails desktop app subscribing to engine events |
+| **API Server** | Control Plane | REST + WebSocket for remote Claw orchestrators |
 
 ---
 
-## 4. Core Flow
+## 4. Trusted Engine vs. Untrusted Agent Plane
 
-### 4.1 Project Lifecycle
+### 4.1 Separation of Authority
+
+This is the foundational architectural boundary in Axiom. Every component falls into one of two categories:
+
+**Trusted Engine (Control Plane):** The Go binary running on the host. It has full authority over:
+
+- SQLite state machine (reads and writes)
+- Project filesystem (reads and writes)
+- Git operations (commits, branches, merges)
+- Container lifecycle (spawn, stop, destroy)
+- Inference brokering (all model API calls)
+- Budget enforcement (tracking, limits, hard stops)
+- File routing and approval pipeline execution
+- Merge queue serialization
+- Semantic index maintenance
+- Event emission to GUI/API subscribers
+- ECO validation and application
+- Model access policy enforcement
+
+**Untrusted Agent Plane:** All LLM agents, running inside Docker containers. They have NO direct authority. They can only:
+
+- Receive structured input via IPC (TaskSpecs, ReviewSpecs, feedback)
+- Submit structured output via IPC (code, reviews, decisions)
+- Request inference via IPC (engine brokers the actual API call)
+- Request actions via structured IPC messages (e.g., "spawn Meeseeks for task X")
+
+### 4.2 The Contract
+
+LLM agents propose. The engine disposes.
+
+Every action an LLM agent wants to perform MUST be submitted as a structured request through IPC. The engine SHALL:
+
+1. Validate the request against current state and policy.
+2. Check authorization (does this agent have permission for this action?).
+3. Check budget (does this action fit within remaining budget?).
+4. Execute the action if all checks pass.
+5. Return the result to the agent via IPC.
+6. Log the action in the event table.
+
+If any check fails, the engine SHALL reject the request and return an error with explanation.
+
+### 4.3 Why This Matters
+
+This separation means:
+
+- A compromised or hallucinating orchestrator cannot write arbitrary files — it can only propose writes that the engine validates.
+- A rogue Meeseeks cannot spawn other containers — it can only request spawns that the engine authorizes.
+- Budget cannot be silently exceeded — the engine enforces limits on every inference request.
+- Crash recovery is clean — the engine's state is the source of truth, not any agent's memory.
+- Audit is complete — every action passes through the engine and is logged.
+
+---
+
+## 5. Core Flow
+
+### 5.1 Project Lifecycle
 
 The Axiom project lifecycle SHALL follow this sequence:
 
@@ -186,7 +267,7 @@ The Axiom project lifecycle SHALL follow this sequence:
 
 3. SRS GENERATION
    Orchestrator analyzes the prompt and generates a structured SRS document.
-   SRS follows the mandated format (see Section 5).
+   SRS follows the mandated format (see Section 6).
 
 4. SRS APPROVAL GATE
    SRS is presented to the user for review and approval.
@@ -196,37 +277,44 @@ The Axiom project lifecycle SHALL follow this sequence:
 
 5. SCOPE LOCK
    Upon approval, the SRS becomes IMMUTABLE.
-   The SRS file is written to `.axiom/srs.md` and SHALL NOT be modified.
-   No changes to scope, requirements, or acceptance criteria are permitted.
+   The SRS file is written to `.axiom/srs.md` with read-only permissions.
+   SHA-256 hash is stored in SQLite for integrity verification.
+   Only functional ECOs (see Section 7) may modify environmental details.
 
 6. TASK DECOMPOSITION
    Orchestrator decomposes the SRS into a hierarchical task tree.
-   Each leaf task is a single, atomic unit of work.
+   Each leaf task is an atomic, appropriately-sized unit of work.
    Tasks are assigned dependency relationships.
+   Test generation tasks are created separately from implementation tasks.
    Task tree is persisted to SQLite.
+   Semantic indexer indexes the current project state.
 
 7. EXECUTION LOOP
-   Orchestrator identifies tasks with no unmet dependencies.
+   Engine identifies tasks with no unmet dependencies.
    For each available task:
-     a. Orchestrator builds a TaskSpec with minimal context.
-     b. Orchestrator selects worker model tier based on task complexity and budget.
-     c. Worker container is spawned with TaskSpec via IPC.
-     d. Worker executes and outputs to container staging area.
-     e. Automated validation runs (compile, lint, tests).
-     f. If automated checks fail: return to worker (max 3 retries).
-     g. If retries exhausted: escalate to next model tier (max 2 escalations).
-     h. If escalation exhausted: mark task BLOCKED, notify orchestrator.
-     i. If automated checks pass: spawn reviewer container with ReviewSpec.
-     j. If reviewer rejects: return to worker with feedback.
-     k. If reviewer approves: pass to orchestrator for final validation.
-     l. If orchestrator rejects: return to worker with feedback.
-     m. If orchestrator approves: kill worker + reviewer containers.
-     n. Write approved files to project filesystem.
-     o. Run project-wide integration check (full build + test suite).
-     p. If integration check fails: revert commit, reroute task.
-     q. If integration check passes: commit to project branch.
-     r. Update task status to DONE.
-     s. Unblock dependent tasks.
+     a. Engine acquires write-set locks for the task's target files/modules.
+     b. Orchestrator builds a TaskSpec with minimum necessary structured context.
+     c. TaskSpec includes base_snapshot (git SHA) it was generated against.
+     d. Engine selects Meeseeks model tier based on orchestrator recommendation + budget.
+     e. Engine spawns Meeseeks container with TaskSpec via IPC.
+     f. Meeseeks submits inference requests via IPC; engine brokers them.
+     g. Meeseeks outputs code + manifest.json to /workspace/staging/.
+     h. Engine extracts staged files into validation sandbox.
+     i. Validation sandbox runs automated checks (compile, lint, tests).
+     j. If checks fail: engine returns errors to Meeseeks (max 3 retries).
+     k. If retries exhausted: engine escalates to next model tier (max 2).
+     l. If escalation exhausted: mark task BLOCKED, notify orchestrator.
+     m. If checks pass: engine spawns reviewer container with ReviewSpec.
+     n. Reviewer evaluates; returns APPROVE or REJECT.
+     o. If reviewer rejects: feedback to Meeseeks, retry.
+     p. If reviewer approves: orchestrator performs final validation.
+     q. If orchestrator rejects: feedback to Meeseeks, retry.
+     r. If orchestrator approves: engine destroys Meeseeks + reviewer containers.
+     s. Engine submits approved files to merge queue.
+     t. Merge queue validates against current HEAD, writes to filesystem, commits.
+     u. Engine re-indexes project via semantic indexer.
+     v. Engine releases write-set locks.
+     w. Engine unblocks dependent tasks.
 
 8. COMPLETION
    All tasks in the task tree reach DONE status.
@@ -234,29 +322,31 @@ The Axiom project lifecycle SHALL follow this sequence:
    User reviews the project branch and merges when satisfied.
 ```
 
-### 4.2 Concurrency
+### 5.2 Concurrency
 
-The system SHALL support up to 10 concurrent worker containers by default. This limit SHALL be user-configurable via `.axiom/config.toml`. BitNet tasks running on the local inference server SHALL NOT count against the container concurrency limit.
+The system SHALL support up to 10 concurrent Meeseeks containers by default. This limit SHALL be user-configurable via `.axiom/config.toml`.
 
-The orchestrator SHALL manage the work queue and parallelize independent tasks within the concurrency limit.
+BitNet tasks running on the local inference server SHALL count against a separate local resource limit (configurable CPU/memory caps), not the container concurrency limit.
 
-### 4.3 User Intervention
+The engine SHALL manage the work queue and parallelize independent tasks within the concurrency limit. Write-set locking prevents conflicting parallel tasks (see Section 16).
+
+### 5.3 User Intervention
 
 During execution, the user MAY issue the following commands:
 
 | Command | Behavior |
 |---|---|
-| `axiom pause` | Stop spawning new workers. Allow running workers and reviewers to complete. Persist state. |
+| `axiom pause` | Stop spawning new Meeseeks. Allow running Meeseeks and reviewers to complete. Persist state. |
 | `axiom cancel` | Kill all active containers. Revert uncommitted changes. Mark project as CANCELLED. |
-| `axiom status` | Display task tree progress, active workers, budget consumed, projected total cost. |
+| `axiom status` | Display task tree progress, active Meeseeks, budget consumed, projected total cost, resource usage. |
 
-The user SHALL NOT modify the SRS or task tree during execution. If the user determines the SRS is incorrect, they MUST cancel and start a new project with a revised prompt.
+The user SHALL NOT modify the SRS or task tree during execution. Functional environmental changes are handled through ECOs (Section 7).
 
 ---
 
-## 5. Software Requirements Specification (SRS) Format
+## 6. Software Requirements Specification (SRS) Format
 
-### 5.1 Structure
+### 6.1 Structure
 
 The SRS SHALL be a structured markdown document with the following required sections in this order:
 
@@ -297,49 +387,142 @@ The SRS SHALL be a structured markdown document with the following required sect
 ### 2.4 Assumptions
 <Assumptions made during SRS generation.>
 
-## 3. Acceptance Criteria
+## 3. Test Strategy
 
-### 3.1 Per-Component Criteria
+### 3.1 Unit Testing
+<Testing approach per component. Framework, coverage targets.>
+
+### 3.2 Integration Testing
+<Cross-component testing approach.>
+
+### 3.3 Security Testing
+<Security scan tools and policies (optional, orchestrator decides).>
+
+## 4. Acceptance Criteria
+
+### 4.1 Per-Component Criteria
 <For each component defined in 1.2, specific testable acceptance criteria.>
 
 #### Component: <Name>
 - [ ] AC-001: <Testable criterion>
 - [ ] AC-002: <Testable criterion>
 
-### 3.2 Integration Criteria
+### 4.2 Integration Criteria
 <System-wide criteria that validate components working together.>
 - [ ] IC-001: <Integration criterion>
 
-### 3.3 Completion Definition
+### 4.3 Completion Definition
 <What "done" means for this project.>
 ```
 
-### 5.2 Immutability
+### 6.2 Immutability
 
-Once approved by the user, the SRS SHALL be written to `.axiom/srs.md` with read-only file permissions. The Axiom engine SHALL reject any attempt to modify this file after acceptance. The SRS SHA-256 hash SHALL be stored in the SQLite database for integrity verification.
+Once approved by the user, the SRS SHALL be written to `.axiom/srs.md` with read-only file permissions. The engine SHALL reject any attempt to modify this file after acceptance. The SRS SHA-256 hash SHALL be stored in the SQLite database for integrity verification.
 
-### 5.3 Traceability
+Only Engineering Change Orders (ECOs) may modify environmental details within the SRS. ECOs SHALL NOT alter the fundamental scope, feature set, or acceptance criteria. See Section 7.
+
+### 6.3 Traceability
 
 Every task in the task tree SHALL reference one or more SRS requirements (e.g., `FR-001`, `AC-003`). This provides traceability from user requirements through task decomposition to committed code.
 
 ---
 
-## 6. Orchestrator
+## 7. Engineering Change Orders (ECO)
 
-### 6.1 Role
+### 7.1 Purpose
 
-The orchestrator is the single top-level agent responsible for the entire project lifecycle. It generates the SRS, decomposes tasks, selects models, validates output, and commits code. The orchestrator is the ONLY entity (other than the user) with access to the project filesystem.
+ECOs provide a controlled mechanism for adapting to external environmental realities discovered during execution, without violating the immutable-scope principle. ECOs address situations where the real world contradicts assumptions in the SRS — not situations where the user wants different features.
 
-### 6.2 Supported Runtimes
+### 7.2 Valid ECO Categories
+
+ECOs SHALL be strictly limited to the following categories. The engine SHALL reject ECOs that do not match a defined category:
+
+| Category | Code | Description | Example |
+|---|---|---|---|
+| Dependency Unavailable | `ECO-DEP` | A specified library, package, or tool is unavailable, deprecated, or incompatible | `left-pad` removed from npm |
+| API Breaking Change | `ECO-API` | An external API endpoint has changed, is unavailable, or behaves differently than documented | REST endpoint returns 404, schema changed |
+| Security Vulnerability | `ECO-SEC` | A specified dependency or approach has a known security vulnerability | CVE discovered in chosen auth library |
+| Platform Incompatibility | `ECO-PLT` | A technology choice is incompatible with the target platform or environment | Library doesn't support specified OS |
+| License Conflict | `ECO-LIC` | A dependency has a license incompatible with project requirements | GPL dependency in MIT project |
+| Provider Limitation | `ECO-PRV` | A cloud provider, service, or API has rate limits, quotas, or constraints not anticipated | Free tier API rate limit too low |
+
+### 7.3 ECO Flow
+
+```
+1. Meeseeks or orchestrator encounters environmental issue.
+2. Orchestrator proposes an ECO to the engine with:
+   - ECO category code
+   - Affected SRS sections/requirements
+   - Description of the environmental issue
+   - Proposed functional substitute
+3. Engine validates the ECO category is in the allowed list.
+4. Engine presents the ECO to the user for approval.
+   (If SRS approval is delegated to Claw, ECO approval is also delegated.)
+5. If approved:
+   - Engine records the ECO as a versioned addendum to the SRS.
+   - Original SRS text is preserved (never overwritten).
+   - Orchestrator identifies affected tasks and replans only those.
+   - Unaffected completed work is preserved.
+6. If rejected:
+   - Orchestrator must find an alternative within the original SRS.
+   - Or the user cancels the project.
+```
+
+### 7.4 ECO Record Format
+
+```markdown
+## ECO-001: [ECO-DEP] Replace deprecated auth library
+
+**Filed:** 2026-03-16T14:30:00Z
+**Status:** Approved
+**Affected SRS Sections:** 1.3 (Technology Decisions), FR-003, AC-005
+
+### Environmental Issue
+The library `passport-oauth2` specified in SRS 1.3 has been deprecated
+and removed from npm as of 2026-03-01.
+
+### Proposed Substitute
+Replace with `arctic` (v2.1), which provides equivalent OAuth2
+functionality with an actively maintained codebase.
+
+### Impact Assessment
+- Tasks 15, 16, 17 (auth module) must be replanned.
+- Tasks 1-14 (completed) are unaffected.
+- No change to acceptance criteria — AC-005 still applies.
+```
+
+### 7.5 What ECOs Are NOT
+
+ECOs SHALL NOT be used for:
+
+- Adding new features or requirements
+- Changing acceptance criteria
+- Expanding or reducing project scope
+- Altering the fundamental architecture
+- User preference changes ("actually, I want React instead of Vue")
+
+Any such change requires canceling the project and starting a new one with a revised prompt.
+
+---
+
+## 8. Orchestrator
+
+### 8.1 Role
+
+The orchestrator is the top-level LLM agent responsible for project-level reasoning: SRS generation, task decomposition, model selection, and final validation. The orchestrator runs inside a Docker container in the Untrusted Agent Plane.
+
+**Critical distinction:** The orchestrator *decides*. The Trusted Engine *executes*. The orchestrator proposes task decompositions, model selections, file approvals, and commits. The engine validates these proposals and performs the actual operations.
+
+### 8.2 Supported Runtimes
 
 | Runtime | Description | Recommended |
 |---|---|---|
-| **Claw** (OpenClaw / NanoClaw / Any Claw-Based Agent) | AI assistant with conversational context. Learns Axiom via skill injection. | **Yes — Primary recommendation** |
+| **Claw** (OpenClaw / NanoClaw) | AI assistant with conversational context. Learns Axiom via skill injection. | **Yes — Primary recommendation** |
 | **Claude Code** | Anthropic's CLI coding agent. Learns Axiom via CLAUDE.md + hooks. | Supported but not recommended (tendency to self-execute rather than delegate) |
 | **Codex** | OpenAI's CLI coding agent. Learns Axiom via system prompt. | Supported |
 | **OpenCode** | Open-source coding agent. Learns Axiom via system prompt. | Supported |
 
-### 6.3 Claw Advantage
+### 8.3 Claw Advantage
 
 When a Claw-based orchestrator is used, it provides two key benefits:
 
@@ -347,7 +530,7 @@ When a Claw-based orchestrator is used, it provides two key benefits:
 
 2. **Conversational Context:** The Claw has prior context from the user's conversation, enabling higher-quality SRS generation even from vague prompts. The Claw understands what the user likely wants based on prior interactions.
 
-### 6.4 SRS Approval Delegation
+### 8.4 SRS Approval Delegation
 
 When the orchestrator is a Claw, the user MAY configure Axiom to delegate SRS approval to the Claw as a proxy. This setting SHALL be configured before project start in `.axiom/config.toml`:
 
@@ -356,104 +539,163 @@ When the orchestrator is a Claw, the user MAY configure Axiom to delegate SRS ap
 srs_approval_delegate = "claw"  # "user" (default) | "claw"
 ```
 
-When set to `"claw"`, the Claw SHALL review and approve the SRS on the user's behalf. The user MAY override this setting at any time.
+When set to `"claw"`, the Claw SHALL review and approve the SRS on the user's behalf. The engine SHALL log that approval was delegated and record the Claw's identity. The user MAY review the SRS and any delegated approval decisions through the GUI or `axiom status` at any time.
 
-### 6.5 Orchestrator Responsibilities
+ECO approval delegation follows the same setting — if SRS approval is delegated to the Claw, ECO approval is also delegated.
+
+### 8.5 Orchestrator–Engine Contract
+
+The orchestrator SHALL interact with the Trusted Engine exclusively through structured IPC requests. The orchestrator SHALL NOT:
+
+- Write to the project filesystem directly
+- Spawn Docker containers directly
+- Execute git commands directly
+- Make model API calls directly
+- Modify the SQLite database directly
+- Bypass budget limits
+
+The engine SHALL expose the following request types to the orchestrator via IPC:
+
+| Request Type | Description |
+|---|---|
+| `submit_srs` | Submit generated SRS for user approval |
+| `submit_eco` | Propose an Engineering Change Order |
+| `create_task` | Add a task to the task tree |
+| `create_task_batch` | Add multiple tasks atomically |
+| `spawn_meeseeks` | Request Meeseeks container for a task |
+| `spawn_reviewer` | Request reviewer container for a task |
+| `spawn_sub_orchestrator` | Request sub-orchestrator container |
+| `approve_output` | Approve Meeseeks output for commit |
+| `reject_output` | Reject Meeseeks output with feedback |
+| `query_index` | Query the semantic indexer |
+| `query_status` | Get current task tree state |
+| `query_budget` | Get budget status |
+| `request_inference` | Submit an inference request to the broker |
+
+### 8.6 Orchestrator Responsibilities
 
 The orchestrator SHALL:
 
 - Generate the SRS from the user's prompt.
 - Present the SRS for approval (to user or delegated Claw).
 - Decompose the approved SRS into a hierarchical task tree.
-- Define project parameters: budget allocation, model routing table, concurrency level, review requirements.
-- Build TaskSpecs for each leaf task with minimal required context.
-- Select the appropriate model tier for each worker and reviewer.
+- Create separate test generation tasks from a different model family than implementation tasks.
+- Define project parameters: budget allocation, model routing table, concurrency level.
+- Build TaskSpecs for each leaf task with minimum necessary structured context.
+- Select the appropriate model tier for each Meeseeks and reviewer.
+- Determine task sizing: small enough to be reliable for the assigned model tier, large enough to preserve code coherence.
 - Spawn sub-orchestrators for complex subtrees when appropriate.
-- Perform final validation of worker output against SRS requirements.
-- Write approved files to the project filesystem.
-- Execute git commits with task references.
+- Perform final validation of Meeseeks output against SRS requirements.
+- Propose file writes and git commits for engine execution.
 - Track budget consumption and adjust strategy to stay within limits.
+- File ECOs when environmental issues are discovered.
 - Report project status and completion.
 
 ---
 
-## 7. Sub-Orchestrators
+## 9. Sub-Orchestrators
 
-### 7.1 Role
+### 9.1 Role
 
 A sub-orchestrator manages a delegated subtree of the task tree. The main orchestrator creates a sub-orchestrator when a portion of the project is complex enough to warrant independent management (e.g., "backend API" or "authentication system").
 
-### 7.2 Runtime
+### 9.2 Runtime
 
 Sub-orchestrators SHALL run exclusively via OpenRouter. The main orchestrator SHALL select the model based on subtree complexity and available budget.
 
-### 7.3 Capabilities
+### 9.3 Container Execution
 
-A sub-orchestrator SHALL:
+Sub-orchestrators SHALL run inside Docker containers in the Untrusted Agent Plane. They SHALL NOT have Docker access or the ability to directly spawn containers.
 
-- Receive a subset of SRS requirements relevant to its subtree.
-- Further decompose its subtree into granular tasks.
-- Build TaskSpecs for its workers.
-- Select model tiers for its workers and reviewers.
-- Spawn and manage worker and reviewer containers within its subtree.
-- Validate worker output against its subset of requirements.
-- Report results back to the main orchestrator.
-- Spawn its own review team if the subtree warrants it.
-- Grant lateral communication permissions between its workers when necessary.
+ALL container spawning (Meeseeks, reviewers, nested sub-orchestrators) is performed exclusively by the Trusted Engine. Sub-orchestrators submit structured requests via IPC (e.g., "spawn Meeseeks for task X with this TaskSpec"). The engine validates and executes these requests.
+
+### 9.4 Capabilities
+
+A sub-orchestrator MAY request (via IPC to the engine):
+
+- Further decomposition of its subtree into granular tasks.
+- Meeseeks spawning for its tasks.
+- Reviewer spawning for its tasks.
+- Sub-orchestrator spawning for nested subtrees.
+- Semantic index queries for context building.
+- Lateral communication channels between its Meeseeks.
+- Review team creation for its subtree.
 
 A sub-orchestrator SHALL NOT:
 
-- Modify the SRS.
+- Modify the SRS (may propose ECOs through the main orchestrator).
 - Access tasks outside its delegated subtree.
 - Exceed its allocated budget partition.
-- Communicate with workers belonging to other sub-orchestrators (unless explicitly permitted by the main orchestrator).
-
-### 7.4 Isolation
-
-Sub-orchestrators SHALL run inside Docker containers. They SHALL receive only the SRS sections and context relevant to their subtree. They SHALL NOT have access to the full project filesystem — file approval flows up to the main orchestrator.
+- Communicate with Meeseeks belonging to other sub-orchestrators (unless explicitly permitted by the main orchestrator via the engine).
+- Directly access the filesystem, Docker, git, or model APIs.
 
 ---
 
-## 8. Workers
+## 10. Meeseeks (Workers)
 
-### 8.1 Role
+### 10.1 Role
 
-A worker is a disposable, single-task agent that executes one TaskSpec inside a Docker container. Workers are the lowest-level agents in the hierarchy.
+A Meeseeks is a disposable, single-task agent that executes one TaskSpec inside a Docker container. Like Mr. Meeseeks from Rick and Morty, each Meeseeks is summoned into existence for a single purpose, completes that purpose, and is immediately destroyed. They do not persist. They do not accumulate context. They exist to serve.
 
-### 8.2 Runtime
+### 10.2 Runtime
 
-Workers SHALL run exclusively via OpenRouter or BitNet local inference. The orchestrator (or sub-orchestrator) SHALL select the model based on task complexity:
+Meeseeks SHALL run exclusively via OpenRouter or BitNet local inference. The orchestrator (or sub-orchestrator) SHALL recommend the model tier; the engine SHALL validate the recommendation against budget and policy.
+
+**Task Sizing Principles:**
+
+Tasks SHOULD be broken down to their smallest sensible size. "Smallest sensible" means:
+
+- **Small enough** to be reliable for the assigned model tier.
+- **Large enough** to preserve code coherence and semantic integrity.
+
+Some tasks are inherently indivisible. For example, "build an API with interconnected endpoints" may require a single, capable Meeseeks (standard or premium tier via OpenRouter) to maintain coherence across the implementation. This is NOT a failure of decomposition — it is correct sizing.
+
+The orchestrator or responsible sub-orchestrator SHALL determine appropriate task granularity based on:
+
+- Code coherence requirements (does splitting break semantic integrity?)
+- Interface surface area (how many touch points?)
+- Model capability at the target tier
+- Budget constraints
 
 | Tier | Models | Use Cases |
 |---|---|---|
-| **Local** | BitNet/Falcon3 | Tool calls, variable renames, config changes, import additions, boilerplate generation |
-| **Cheap** | Haiku, Flash, small open-source | Simple functions, unit tests, straightforward implementations |
-| **Standard** | Sonnet, GPT-4o, mid-tier open-source | Most coding tasks, moderate complexity, refactoring |
-| **Premium** | Opus, o1, large open-source | Complex algorithms, architectural patterns, critical-path code |
+| **Local** | BitNet/Falcon3 | Variable renames, import additions, config changes, boilerplate, file moves, simple formatting |
+| **Cheap** | Haiku, Flash, small open-source | Simple functions, straightforward implementations, small modifications |
+| **Standard** | Sonnet, GPT-4o, mid-tier open-source | Most coding tasks, moderate complexity, refactoring, multi-file changes |
+| **Premium** | Opus, o1, large open-source | Complex algorithms, coherent API construction, architectural patterns, critical-path code |
 
-### 8.3 TaskSpec Format
+### 10.3 TaskSpec Format
 
-Every worker SHALL receive a self-contained TaskSpec. The TaskSpec SHALL include all information the worker needs and nothing more.
+Every Meeseeks SHALL receive a self-contained TaskSpec. The TaskSpec SHALL include all information the Meeseeks needs and nothing more. Context level is determined by the orchestrator.
 
 ```markdown
 # TaskSpec: <task-id>
 
+## Base Snapshot
+git_sha: <sha of the project state this spec was built against>
+
 ## Objective
 <Clear, single-sentence description of what to produce.>
 
-## Context Files
-<Only the specific files and/or code snippets the worker needs.
- Files are included inline — the worker has no filesystem access
- beyond its container.>
+## Context
+<Minimum necessary structured context, at the tier appropriate
+ for this task. May include:>
 
-### File: src/handlers/auth.go (lines 1-45)
-```go
-<relevant code snippet>
-`` `
+### Symbol Context (tier: symbol)
+<Function signatures, type definitions, interface contracts>
+
+### File Context (tier: file)
+<Complete relevant source files>
+
+### Package Context (tier: package)
+<Full package/module with dependencies>
+
+### Repo Map (tier: repo-map)
+<Directory structure, dependency graph, export index>
 
 ## Interface Contract
 <Function signatures, type definitions, API shapes, and data structures
- that the worker's output MUST conform to.>
+ that the Meeseeks' output MUST conform to.>
 
 ## Constraints
 - Language: <language and version>
@@ -464,43 +706,70 @@ Every worker SHALL receive a self-contained TaskSpec. The TaskSpec SHALL include
 ## Acceptance Criteria
 - [ ] <Specific, testable criterion>
 - [ ] <Specific, testable criterion>
-- [ ] <Specific, testable criterion>
 
 ## Output Format
 Write all output files to /workspace/staging/
-Maintain the target directory structure within staging.
+Include a manifest.json describing all file operations.
 ```
 
-### 8.4 Worker Lifecycle
+### 10.4 Output Manifest
 
-1. Docker container is spawned with the TaskSpec delivered via IPC.
-2. Worker model processes the TaskSpec and generates code.
-3. Worker writes output files to `/workspace/staging/` inside the container.
-4. Worker signals completion.
-5. Axiom extracts staged files and routes them through the approval pipeline.
-6. If the worker receives revision feedback, it revises and resubmits.
-7. Upon final approval (or max retry exhaustion), the container is destroyed.
+Every Meeseeks SHALL emit a `manifest.json` alongside its output files in `/workspace/staging/`:
 
-### 8.5 Worker Restrictions
+```json
+{
+    "task_id": "task-042",
+    "base_snapshot": "abc123def",
+    "files": {
+        "added": ["src/handlers/auth.go", "src/handlers/auth_test.go"],
+        "modified": ["src/routes/api.go"],
+        "deleted": ["src/handlers/old_auth.go"],
+        "renamed": [
+            {"from": "src/utils/hash.go", "to": "src/crypto/hash.go"}
+        ]
+    }
+}
+```
 
-Workers SHALL NOT:
+The File Router SHALL use this manifest to:
 
-- Access the project filesystem.
-- Know the project name, repository, or broader architecture.
-- Communicate with other workers (unless explicitly granted by the orchestrator).
-- Access the internet (all model calls go through the host credential proxy).
+- Handle file deletions and renames (not possible via raw filesystem output alone)
+- Detect write-set conflicts early
+- Validate that the Meeseeks only touched files within its expected scope
+- Reject unexpected file operations (e.g., Meeseeks modifying files outside its task scope)
+
+### 10.5 Meeseeks Lifecycle
+
+1. Engine spawns Docker container with TaskSpec delivered via IPC.
+2. Meeseeks receives TaskSpec and begins work.
+3. Meeseeks submits inference requests via IPC; engine brokers them through the Inference Broker.
+4. Meeseeks writes output files + `manifest.json` to `/workspace/staging/`.
+5. Meeseeks signals completion via IPC.
+6. Engine extracts staged files and routes them through the approval pipeline.
+7. If the Meeseeks receives revision feedback via IPC, it revises and resubmits (same container reused for retries).
+8. Upon final approval (or max retry/escalation exhaustion), the engine destroys the container.
+
+### 10.6 Meeseeks Restrictions
+
+Meeseeks SHALL NOT:
+
+- Access the project filesystem (not mounted).
+- Communicate with other Meeseeks (unless explicitly granted by the orchestrator through the engine).
+- Make direct model API calls (all inference goes through the engine's Inference Broker).
+- Access the internet directly (no outbound network).
 - Persist any state between tasks (containers are destroyed).
 - Modify their own runtime environment.
+- Spawn other containers.
 
 ---
 
-## 9. Reviewers
+## 11. Reviewers
 
-### 9.1 Role
+### 11.1 Role
 
-A reviewer is a disposable, single-task agent that evaluates a worker's output against the original TaskSpec. Reviewers run inside Docker containers and are destroyed after completing their review.
+A reviewer is a disposable, single-task agent that evaluates a Meeseeks' output against the original TaskSpec. Reviewers run inside Docker containers and are destroyed after completing their review.
 
-### 9.2 Runtime
+### 11.2 Runtime
 
 Reviewers SHALL run via OpenRouter or BitNet local inference. The model tier for a reviewer SHALL be appropriate for the complexity of the task being reviewed:
 
@@ -511,20 +780,51 @@ Reviewers SHALL run via OpenRouter or BitNet local inference. The model tier for
 | Standard (moderate) | Standard (Sonnet/GPT-4o) |
 | Premium (complex) | Premium (Opus/o1) |
 
-### 9.3 Mandate
+### 11.3 Model Family Diversification
 
-Every task SHALL have a reviewer. No worker output SHALL be promoted to the project filesystem without passing reviewer approval.
+For **standard and premium tier** tasks, the reviewer SHOULD be from a different model family than the Meeseeks that produced the work. This prevents correlated blind spots and rubber-stamping.
 
-### 9.4 ReviewSpec Format
+Example: If the Meeseeks used Claude Sonnet, the reviewer should use GPT-4o or an open-source model, not Claude Haiku.
+
+For local and cheap tiers, model family diversification is OPTIONAL (the tasks are simple enough that correlated errors are unlikely).
+
+### 11.4 Mandate
+
+Every task SHALL have a reviewer. No Meeseeks output SHALL be promoted to the project filesystem without passing reviewer approval.
+
+**Batched Review for Trivial Tasks:** For local-tier (BitNet) tasks, the engine MAY batch multiple related tasks into a single ReviewSpec. Batched tasks MUST be functionally related (e.g., "these five renames all affect the same module and must be correct together"). The reviewer evaluates the batch as a coherent unit.
+
+### 11.5 Test Authorship Separation
+
+Tests SHALL NOT be authored by the same Meeseeks that wrote the implementation. Test generation SHALL be a separate task assigned to a Meeseeks from a **different model family** than the implementation Meeseeks.
+
+This prevents circular validation ("tests pass" is not meaningful if the same model wrote both the code and the tests that validate it).
+
+The orchestrator SHALL create test generation tasks as siblings or dependents of implementation tasks, explicitly specifying a different model family.
+
+### 11.6 Risky File Escalation
+
+Certain file types require elevated review regardless of task tier. The following file types SHALL always receive **standard-tier or higher** review:
+
+- CI/CD configuration files (`.github/workflows/`, `Jenkinsfile`, etc.)
+- Package manifests and lockfiles (`package.json`, `go.mod`, `requirements.txt`, etc.)
+- Authentication and authorization code
+- Security-related code (encryption, hashing, token handling)
+- Infrastructure definitions (Dockerfile, docker-compose, Terraform, etc.)
+- Build scripts and Makefiles
+- Database migration files
+
+### 11.7 ReviewSpec Format
 
 ```markdown
 # ReviewSpec: <task-id>
 
 ## Original TaskSpec
-<The complete TaskSpec that was given to the worker.>
+<The complete TaskSpec that was given to the Meeseeks.>
 
-## Worker Output
-<The complete set of files produced by the worker.>
+## Meeseeks Output
+<The complete set of files produced by the Meeseeks.>
+<Includes manifest.json showing all file operations.>
 
 ## Automated Check Results
 ✅ Compilation: PASS
@@ -534,8 +834,14 @@ Every task SHALL have a reviewer. No worker output SHALL be promoted to the proj
   - line 45: unused variable `tmp` (non-blocking)
 
 ## Review Instructions
-Evaluate the worker's output against the original TaskSpec.
+Evaluate the Meeseeks' output against the original TaskSpec.
 For each acceptance criterion, determine if it is satisfied.
+
+Check for:
+- Correctness against acceptance criteria
+- Interface contract compliance
+- Obvious bugs, edge cases, or security issues
+- Code quality and style compliance
 
 Respond in the following format:
 
@@ -546,207 +852,430 @@ Respond in the following format:
 - [ ] AC-002: PASS | FAIL — <explanation>
 
 ### Feedback (if REJECT)
-<Specific, actionable feedback for the worker to address.
+<Specific, actionable feedback for the Meeseeks to address.
  Reference exact line numbers and code sections.>
 ```
 
-### 9.5 Reviewer Restrictions
+### 11.8 Reviewer Restrictions
 
 Reviewers SHALL NOT:
 
-- Modify the worker's code (reviewers evaluate, they do not fix).
+- Modify the Meeseeks' code (reviewers evaluate, they do not fix).
 - Access the project filesystem.
-- Communicate with the worker directly (feedback is routed through Axiom).
+- Communicate with the Meeseeks directly (feedback is routed through the engine).
 - Know the broader project context beyond the ReviewSpec.
+- Make direct model API calls.
 
 ---
 
-## 10. Docker Sandbox Architecture
+## 12. Docker Sandbox Architecture
 
-### 10.1 Design Origin
+### 12.1 Design Origin
 
-The Docker sandbox architecture is adapted from the NanoClaw container isolation system. It provides OS-level isolation for all workers and reviewers.
+The Docker sandbox architecture is adapted from the NanoClaw container isolation system. It provides OS-level isolation for all agents in the Untrusted Agent Plane.
 
-### 10.2 Container Image
+### 12.2 Container Image Strategy
 
-Axiom SHALL provide a base container image (`axiom-worker:latest`) built from the following specification:
+Axiom SHALL provide language-specific container images to ensure workers have appropriate toolchains:
 
-```dockerfile
-FROM node:22-slim
+| Image | Contents | Use Case |
+|---|---|---|
+| `axiom-meeseeks-go:latest` | Go toolchain, golangci-lint | Go projects |
+| `axiom-meeseeks-node:latest` | Node.js, npm, TypeScript, eslint | JavaScript/TypeScript projects |
+| `axiom-meeseeks-python:latest` | Python 3, pip, ruff, mypy | Python projects |
+| `axiom-meeseeks-multi:latest` | Go + Node.js + Python (default) | Multi-language projects |
 
-# Build tools for compilation checks
-RUN apt-get update && apt-get install -y \
-    build-essential git curl wget \
-    && rm -rf /var/lib/apt/lists/*
+Users MAY create custom images with additional language runtimes or tools. Custom images are configured in `.axiom/config.toml`:
 
-# Language runtimes (extensible by user)
-# Go, Python, Node.js available by default
-
-WORKDIR /workspace
-RUN mkdir -p /workspace/staging /workspace/ipc/input /workspace/ipc/output
-
-USER node
-ENTRYPOINT ["/app/entrypoint.sh"]
+```toml
+[docker]
+image = "axiom-meeseeks-multi:latest"   # default
+# image = "my-custom-axiom-image:v1"    # custom
 ```
 
-The image SHALL be extensible — users MAY create custom images with additional language runtimes or tools as needed for their projects.
-
-### 10.3 Volume Mounts
+### 12.3 Volume Mounts
 
 | Host Path | Container Path | Mode | Purpose |
 |---|---|---|---|
 | `.axiom/containers/specs/<task-id>/` | `/workspace/spec/` | read-only | TaskSpec or ReviewSpec input |
-| `.axiom/containers/staging/<task-id>/` | `/workspace/staging/` | read-write | Worker output staging area |
+| `.axiom/containers/staging/<task-id>/` | `/workspace/staging/` | read-write | Meeseeks output staging area |
 | `.axiom/containers/ipc/<task-id>/` | `/workspace/ipc/` | read-write | IPC communication channel |
 
-The project filesystem SHALL NOT be mounted into worker or reviewer containers under any circumstances.
+The project filesystem SHALL NOT be mounted into Meeseeks or reviewer containers under any circumstances.
 
-### 10.4 Network Isolation
+### 12.4 Network Isolation
 
-Worker containers SHALL have network access restricted to:
+Containers in the Untrusted Agent Plane SHALL have NO outbound network access. All model inference requests SHALL be submitted via IPC to the engine, which brokers them through the Inference Broker.
 
-- `host.docker.internal:3001` — Credential proxy (for OpenRouter API calls)
-- `host.docker.internal:3002` — BitNet local inference server
+The only network access permitted is to the host's Inference Broker (for containers that use the broker directly in future optimized configurations). By default, all communication is filesystem IPC.
 
-All other network access SHALL be blocked. Workers SHALL NOT be able to reach the internet directly.
+### 12.5 Resource Limits
 
-### 10.5 Credential Proxy
+Every container SHALL have explicit resource limits enforced via Docker:
 
-The credential proxy SHALL run on the host at port 3001. It SHALL:
+```toml
+# .axiom/config.toml
+[docker]
+cpu_limit = 0.5       # CPU cores per container
+mem_limit = "2g"      # Memory limit per container
+timeout_minutes = 30  # Hard timeout per container
+```
 
-- Accept API requests from containers with placeholder credentials.
-- Inject the user's actual OpenRouter API key before forwarding to the upstream provider.
-- Return responses to the container.
-- Never expose the actual API key to the container environment.
+The engine SHALL enforce these limits on every `docker run` command. The GUI SHALL display resource usage warnings when system utilization exceeds 70%.
 
-### 10.6 Container Lifecycle Management
+### 12.6 Container Lifecycle Management
 
-The Axiom engine SHALL:
+The engine SHALL:
 
 - Spawn containers using `docker run --rm` for automatic cleanup.
+- Apply resource limits (`--cpus`, `--memory`) from configuration.
 - Name containers with the pattern `axiom-<task-id>-<timestamp>` for tracking.
 - Enforce a hard timeout (default: 30 minutes, configurable) per container.
 - Run orphan cleanup on startup, killing any `axiom-*` containers from prior crashed sessions.
 - Track active container count and enforce the concurrency limit.
 - Destroy containers immediately upon task approval or final retry exhaustion.
+- Log all container lifecycle events to the events table.
 
-### 10.7 Security Layers
+ALL container spawning is performed by the engine. No LLM agent — including orchestrators and sub-orchestrators — SHALL directly invoke Docker.
+
+### 12.7 Security Layers
 
 | Layer | Mechanism |
 |---|---|
 | OS isolation | Docker container (separate filesystem, network, process namespace) |
-| Non-root execution | Containers run as `node` user |
+| Non-root execution | Containers run as unprivileged user |
 | No project access | Project filesystem is never mounted |
-| Credential isolation | API keys injected by host-side proxy, never in container env |
-| Network restriction | Only credential proxy and BitNet server reachable |
-| Staging boundary | Workers can only write to `/workspace/staging/` |
+| No network access | Containers have no outbound network; all inference via IPC |
+| Engine-mediated inference | Containers never call model APIs directly |
+| Staging boundary | Meeseeks can only write to `/workspace/staging/` |
+| Output manifest | All file operations declared in manifest.json |
 | IPC boundary | Communication only through filesystem IPC |
-| Timeout enforcement | Hard kill after configurable timeout |
+| Resource limits | CPU, memory, and timeout caps per container |
 | Orphan cleanup | Stale containers destroyed on engine startup |
 
 ---
 
-## 11. File Router & Approval Pipeline
+## 13. Validation Sandbox
 
-### 11.1 Overview
+### 13.1 Purpose
 
-The file router is the mechanism by which worker output moves from container staging to the project filesystem. No file SHALL reach the project filesystem without passing through the full approval pipeline.
+The validation sandbox is a dedicated Docker container class for running automated checks (compilation, linting, tests) against untrusted Meeseeks output. This prevents malicious or broken generated code from executing in the trusted environment.
 
-### 11.2 Pipeline Stages
+### 13.2 Threat Model
+
+Meeseeks output is untrusted code. Running it directly on the host exposes the system to:
+
+- Malicious test files that execute arbitrary commands
+- Package install scripts that exfiltrate data
+- Build hooks that modify the host filesystem
+- Generator scripts that spawn processes
+- Malicious linter plugins
+- Dependency supply-chain attacks
+
+The validation sandbox contains all of these risks within a disposable Docker container.
+
+### 13.3 Validation Sandbox Specification
 
 ```
-Stage 1: EXTRACTION
-  Axiom extracts files from /workspace/staging/<task-id>/
-  Files are copied to a host-side staging directory.
-
-Stage 2: AUTOMATED VALIDATION
-  Axiom runs automated checks against the staged files:
-    - Compilation (language-appropriate: go build, tsc, gcc, etc.)
-    - Linting (language-appropriate: golangci-lint, eslint, ruff, etc.)
-    - Unit tests (if test files are included in the TaskSpec)
-    - Interface contract validation (do exports match the spec?)
-
-  If ANY check fails:
-    → Errors are packaged as feedback.
-    → Feedback is delivered to the worker via IPC.
-    → Worker revises and resubmits.
-    → Max 3 retries before escalation.
-
-Stage 3: REVIEWER EVALUATION
-  A reviewer container is spawned with a ReviewSpec containing:
-    - The original TaskSpec
-    - The worker's output
-    - Automated check results
-
-  Reviewer evaluates and returns APPROVE or REJECT with feedback.
-
-  If REJECT:
-    → Feedback is delivered to the worker via IPC.
-    → Worker revises and resubmits.
-    → Reviewer is destroyed and a new one spawned for the revision.
-
-Stage 4: ORCHESTRATOR VALIDATION
-  The orchestrator receives the approved output and validates it
-  against the relevant SRS requirements.
-
-  If orchestrator rejects:
-    → Feedback is delivered to the worker via IPC.
-    → Worker revises and resubmits.
-
-Stage 5: COMMIT
-  Approved files are written to the project filesystem.
-  Project-wide integration check runs (full build + full test suite).
-
-  If integration check fails:
-    → Commit is reverted.
-    → Task is rerouted (new worker, potentially different approach).
-
-  If integration check passes:
-    → Changes are committed to the project branch.
-    → Task status is updated to DONE in SQLite.
-    → Dependent tasks are unblocked.
+┌─────────────────────────────────────────────┐
+│           VALIDATION SANDBOX                 │
+│                                              │
+│  Base: read-only snapshot of project at HEAD │
+│  Overlay: writable layer for Meeseeks output │
+│  Network: NONE (no outbound access)          │
+│  Secrets: NONE (no API keys, tokens, creds)  │
+│  Resources: CPU + memory limited             │
+│  Timeout: configurable (default 10 min)      │
+│                                              │
+│  Runs:                                       │
+│  1. Dependency install (from lockfile only)   │
+│  2. Compilation                              │
+│  3. Linting                                  │
+│  4. Unit tests                               │
+│  5. Security scanning (optional)             │
+│                                              │
+│  Outputs:                                    │
+│  - Pass/fail per check                       │
+│  - Error output for failed checks            │
+│  - Test coverage report                      │
+│  - Security scan results                     │
+└─────────────────────────────────────────────┘
 ```
 
-### 11.3 Fast Track
+### 13.4 Sandbox Configuration
 
-For trivial tasks (BitNet tier), the orchestrator MAY configure a fast track that skips Stage 4 (orchestrator validation) when automated checks and reviewer both pass. This reduces latency for simple operations. The fast track SHALL be opt-in per task, decided by the orchestrator.
+```toml
+# .axiom/config.toml
+[validation]
+timeout_minutes = 10
+cpu_limit = 1.0
+mem_limit = "4g"
+network = "none"                    # MUST be "none"
+allow_dependency_install = true     # from lockfile only
+security_scan = false               # optional trivy/gosec
+```
+
+### 13.5 Dependency Handling
+
+If validation requires dependency installation (e.g., `npm install`, `go mod download`):
+
+- Dependencies SHALL be installed from lockfiles only (`package-lock.json`, `go.sum`).
+- No network access during installation — dependencies MUST be pre-cached or vendored.
+- If dependencies are unavailable, the engine SHALL pre-populate a dependency cache volume that the validation sandbox can mount read-only.
+
+### 13.6 Integration with Approval Pipeline
+
+The validation sandbox sits between Meeseeks output and reviewer evaluation in the approval pipeline (see Section 14). Its results are included in the ReviewSpec so the reviewer sees automated check outcomes.
 
 ---
 
-## 12. Task System
+## 14. File Router & Approval Pipeline
 
-### 12.1 Task Tree
+### 14.1 Overview
 
-The orchestrator SHALL decompose the SRS into a hierarchical task tree. The tree SHALL be stored in SQLite with the following schema:
+The file router is the mechanism by which Meeseeks output moves from container staging to the project filesystem. No file SHALL reach the project filesystem without passing through the full approval pipeline. All pipeline operations are executed by the Trusted Engine.
+
+### 14.2 Pipeline Stages
+
+```
+Stage 1: EXTRACTION & MANIFEST VALIDATION
+  Engine extracts files from /workspace/staging/<task-id>/.
+  Engine validates manifest.json:
+    - All files listed in manifest exist in staging.
+    - No files in staging are unlisted in manifest.
+    - All paths are canonicalized (no traversal, no symlinks).
+    - No symlinks, device files, FIFOs, or oversized files.
+    - All paths are within the expected output scope.
+    - Deletions and renames are explicitly declared.
+  Engine rejects any Meeseeks output that fails manifest validation.
+
+Stage 2: VALIDATION SANDBOX
+  Engine spawns a validation sandbox container with:
+    - Read-only snapshot of project at current HEAD.
+    - Writable overlay with Meeseeks output applied.
+    - No network, no secrets, resource-limited.
+  Validation sandbox runs:
+    - Compilation (language-appropriate: go build, tsc, gcc, etc.)
+    - Linting (language-appropriate: golangci-lint, eslint, ruff, etc.)
+    - Unit tests (both existing tests and any new tests from separate test tasks)
+    - Security scan (optional, if configured)
+  Validation sandbox is destroyed after checks complete.
+
+  If ANY check fails:
+    → Errors are packaged as structured feedback.
+    → Feedback is delivered to the Meeseeks via IPC.
+    → Meeseeks revises and resubmits.
+    → Max 3 retries before model escalation.
+
+Stage 3: REVIEWER EVALUATION
+  Engine spawns a reviewer container with a ReviewSpec containing:
+    - The original TaskSpec.
+    - The Meeseeks' output + manifest.
+    - Validation sandbox results.
+  Reviewer model is from a different family than Meeseeks (for standard+ tiers).
+  Reviewer evaluates and returns APPROVE or REJECT with feedback.
+
+  If REJECT:
+    → Feedback is delivered to the Meeseeks via IPC.
+    → Meeseeks revises and resubmits.
+    → Reviewer is destroyed; new reviewer spawned for revision.
+
+Stage 4: ORCHESTRATOR VALIDATION
+  The orchestrator receives the approved output and validates it
+  against the relevant SRS requirements via IPC.
+
+  If orchestrator rejects:
+    → Feedback is delivered to the Meeseeks via IPC.
+    → Meeseeks revises and resubmits.
+
+Stage 5: MERGE QUEUE
+  Approved files are submitted to the serialized merge queue.
+  Merge queue validates against current HEAD:
+    - Check base_snapshot matches or is cleanly mergeable.
+    - Run integration checks in validation sandbox against merged state.
+  If merge conflicts or integration failure:
+    → Task is re-queued with updated context from current HEAD.
+  If clean:
+    → Engine writes files to project filesystem.
+    → Engine commits to project branch.
+    → Engine re-indexes project via semantic indexer.
+    → Engine releases write-set locks.
+    → Task status updated to DONE.
+    → Dependent tasks unblocked.
+```
+
+### 14.3 Batched Review for Trivial Tasks
+
+For local-tier (BitNet) tasks, the engine MAY batch multiple related tasks through stages 3-4 as a single ReviewSpec. Requirements for batching:
+
+- All tasks in the batch MUST be functionally related (same module, same feature).
+- The batch MUST be reviewed as a coherent unit (reviewer sees all outputs together).
+- If any task in the batch fails review, the entire batch is returned for revision.
+
+---
+
+## 15. Task System
+
+### 15.1 Task Tree
+
+The orchestrator SHALL decompose the SRS into a hierarchical task tree. The tree SHALL be stored in SQLite with properly normalized tables.
+
+### 15.2 Core Schema
 
 ```sql
+-- Tasks: durable identity and metadata
 CREATE TABLE tasks (
-    id          TEXT PRIMARY KEY,
-    parent_id   TEXT REFERENCES tasks(id),
-    title       TEXT NOT NULL,
-    description TEXT,
-    status      TEXT NOT NULL DEFAULT 'queued',
-    tier        TEXT NOT NULL,            -- local | cheap | standard | premium
-    srs_refs    TEXT,                     -- comma-separated SRS requirement IDs
-    assigned_to TEXT,                     -- container ID when active
-    model_used  TEXT,                     -- model ID used for execution
-    cost        REAL DEFAULT 0,           -- cost in USD for this task
-    retries     INTEGER DEFAULT 0,
-    max_retries INTEGER DEFAULT 3,
-    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
-    started_at  DATETIME,
-    completed_at DATETIME,
-    FOREIGN KEY (parent_id) REFERENCES tasks(id)
+    id              TEXT PRIMARY KEY,
+    parent_id       TEXT REFERENCES tasks(id),
+    title           TEXT NOT NULL,
+    description     TEXT,
+    status          TEXT NOT NULL DEFAULT 'queued',
+    tier            TEXT NOT NULL,              -- local | cheap | standard | premium
+    task_type       TEXT NOT NULL DEFAULT 'implementation',  -- implementation | test | review
+    target_files    TEXT,                       -- JSON array of expected output paths
+    base_snapshot   TEXT,                       -- git SHA this task was planned against
+    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    completed_at    DATETIME
 );
 
+-- Task to SRS requirement mapping (proper junction table)
+CREATE TABLE task_srs_refs (
+    task_id     TEXT NOT NULL REFERENCES tasks(id),
+    srs_ref     TEXT NOT NULL,                 -- e.g., "FR-001", "AC-003"
+    PRIMARY KEY (task_id, srs_ref)
+);
+
+-- Task dependencies
 CREATE TABLE task_dependencies (
     task_id    TEXT NOT NULL REFERENCES tasks(id),
     depends_on TEXT NOT NULL REFERENCES tasks(id),
     PRIMARY KEY (task_id, depends_on)
 );
+
+-- Write-set locks (prevents concurrent modification of same files)
+CREATE TABLE task_locks (
+    file_path   TEXT NOT NULL,
+    task_id     TEXT NOT NULL REFERENCES tasks(id),
+    locked_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (file_path)
+);
+
+-- Individual execution attempts (preserves retry history)
+CREATE TABLE task_attempts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id         TEXT NOT NULL REFERENCES tasks(id),
+    attempt_number  INTEGER NOT NULL,
+    model_id        TEXT NOT NULL,
+    model_family    TEXT NOT NULL,              -- anthropic | openai | meta | local
+    base_snapshot   TEXT NOT NULL,              -- git SHA for this attempt
+    status          TEXT NOT NULL,              -- running | passed | failed | escalated
+    input_tokens    INTEGER,
+    output_tokens   INTEGER,
+    cost_usd        REAL DEFAULT 0,
+    failure_reason  TEXT,
+    feedback        TEXT,                       -- feedback given for retry
+    started_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    completed_at    DATETIME
+);
+
+-- Validation runs per attempt
+CREATE TABLE validation_runs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    attempt_id      INTEGER NOT NULL REFERENCES task_attempts(id),
+    check_type      TEXT NOT NULL,             -- compile | lint | test | security
+    status          TEXT NOT NULL,             -- pass | fail | skip
+    output          TEXT,                      -- error output if failed
+    duration_ms     INTEGER,
+    timestamp       DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Review runs per attempt
+CREATE TABLE review_runs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    attempt_id      INTEGER NOT NULL REFERENCES task_attempts(id),
+    reviewer_model  TEXT NOT NULL,
+    reviewer_family TEXT NOT NULL,
+    verdict         TEXT NOT NULL,             -- approve | reject
+    feedback        TEXT,
+    cost_usd        REAL DEFAULT 0,
+    timestamp       DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Artifact tracking (file hashes for audit)
+CREATE TABLE task_artifacts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    attempt_id      INTEGER NOT NULL REFERENCES task_attempts(id),
+    file_path       TEXT NOT NULL,
+    operation       TEXT NOT NULL,             -- add | modify | delete | rename
+    sha256          TEXT,
+    size_bytes      INTEGER,
+    timestamp       DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Container sessions
+CREATE TABLE container_sessions (
+    id              TEXT PRIMARY KEY,          -- container name
+    task_id         TEXT NOT NULL REFERENCES tasks(id),
+    container_type  TEXT NOT NULL,             -- meeseeks | reviewer | validator | sub_orchestrator
+    image           TEXT NOT NULL,
+    model_id        TEXT,
+    cpu_limit       REAL,
+    mem_limit       TEXT,
+    started_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    stopped_at      DATETIME,
+    exit_reason     TEXT                       -- completed | timeout | killed | error
+);
+
+-- Event log (full audit trail)
+CREATE TABLE events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type      TEXT NOT NULL,
+    task_id         TEXT,
+    agent_type      TEXT,                      -- orchestrator | sub_orchestrator | meeseeks | reviewer | engine
+    agent_id        TEXT,
+    details         TEXT,                      -- JSON payload
+    timestamp       DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Cost tracking (aggregated view)
+CREATE TABLE cost_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id         TEXT REFERENCES tasks(id),
+    attempt_id      INTEGER REFERENCES task_attempts(id),
+    agent_type      TEXT NOT NULL,
+    model_id        TEXT NOT NULL,
+    input_tokens    INTEGER,
+    output_tokens   INTEGER,
+    cost_usd        REAL NOT NULL,
+    timestamp       DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Engineering Change Orders
+CREATE TABLE eco_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    eco_code        TEXT NOT NULL,             -- ECO-DEP, ECO-API, etc.
+    category        TEXT NOT NULL,
+    description     TEXT NOT NULL,
+    affected_refs   TEXT NOT NULL,             -- JSON array of SRS refs
+    proposed_change TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'proposed', -- proposed | approved | rejected
+    approved_by     TEXT,                      -- "user" or "claw:<identity>"
+    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    resolved_at     DATETIME
+);
 ```
 
-### 12.2 Task States
+### 15.3 Database Configuration
+
+SQLite SHALL be configured in WAL (Write-Ahead Logging) mode for concurrent read performance with connection pooling in the Go engine:
+
+```go
+db.Exec("PRAGMA journal_mode=WAL")
+db.Exec("PRAGMA busy_timeout=5000")
+db.SetMaxOpenConns(10)
+```
+
+### 15.4 Task States
 
 ```
 queued → in_progress → in_review → done
@@ -761,50 +1290,154 @@ queued → in_progress → in_review → done
 
 | State | Description |
 |---|---|
-| `queued` | Task is waiting for dependencies to resolve and a worker to be assigned. |
-| `in_progress` | A worker container is actively executing this task. |
-| `in_review` | Worker output has passed automated checks and is being reviewed. |
+| `queued` | Task is waiting for dependencies to resolve and a Meeseeks to be assigned. |
+| `in_progress` | A Meeseeks container is actively executing this task. |
+| `in_review` | Meeseeks output has passed automated checks and is being reviewed. |
 | `done` | Task has passed all validation and output is committed. |
 | `failed` | Task has failed automated checks or review. Awaiting retry. |
 | `blocked` | Task has exhausted all retries and escalations. Requires orchestrator intervention. |
 
-### 12.3 Dependency Enforcement
+### 15.5 Dependency Enforcement
 
 A task SHALL NOT transition from `queued` to `in_progress` unless ALL tasks in its dependency set have status `done`.
 
-Axiom SHALL detect circular dependencies at task creation time and reject them with an error.
+The engine SHALL detect circular dependencies at task creation time and reject them with an error.
 
-### 12.4 Task Decomposition Principles
+### 15.6 Task Decomposition Principles
 
 The orchestrator SHALL decompose tasks according to these principles:
 
-1. **Atomic:** Each leaf task SHALL produce a single, testable unit of work.
+1. **Appropriately sized:** Small enough to be reliable for the assigned model tier, large enough to preserve code coherence.
 2. **Independent:** Tasks SHOULD minimize dependencies on other tasks.
-3. **Small:** Tasks SHALL be broken down to the smallest completable unit. This maximizes the use of cheap/local models.
-4. **Traceable:** Every task SHALL reference one or more SRS requirements.
+3. **Traceable:** Every task SHALL reference one or more SRS requirements.
+4. **Test-separated:** Test generation tasks SHALL be separate from implementation tasks, assigned to different model families.
+5. **Coherence-preserving:** Tasks that are inherently interconnected (e.g., building a multi-endpoint API) SHOULD remain as single tasks assigned to capable models, rather than being artificially split.
 
 ---
 
-## 13. Model Registry
+## 16. Concurrency, Snapshots & Merge Queue
 
-### 13.1 Purpose
+### 16.1 The Concurrency Problem
+
+When multiple Meeseeks execute in parallel, their outputs may conflict:
+
+- Two tasks edit the same file.
+- Two tasks edit different files but depend on a shared interface.
+- A TaskSpec was created against stale code (another task committed since).
+- A task passes checks against one snapshot but fails when merged onto latest HEAD.
+
+Axiom solves this through three mechanisms: base snapshot pinning, write-set locking, and a serialized merge queue.
+
+### 16.2 Base Snapshot Pinning
+
+Every TaskSpec SHALL include a `base_snapshot` field containing the git SHA of the project state the TaskSpec was generated against. This SHA is recorded in the `task_attempts` table.
+
+The merge queue SHALL verify that the Meeseeks' output is compatible with the current HEAD. If the HEAD has advanced beyond the base snapshot, the merge queue SHALL:
+
+1. Attempt a clean merge.
+2. If clean: proceed with integration checks.
+3. If conflicting: re-queue the task with an updated base snapshot and fresh context from the semantic indexer.
+
+### 16.3 Write-Set Locking
+
+When the engine dispatches a task, it SHALL acquire write-set locks for the files/modules the task is expected to modify (based on `target_files` in the task record and the orchestrator's TaskSpec).
+
+| Rule | Behavior |
+|---|---|
+| Lock acquisition | Engine locks target file paths in `task_locks` table before spawning Meeseeks |
+| Lock conflict | If a file is already locked by another active task, the new task waits in `queued` |
+| Lock release | Locks released after merge queue commits or task fails |
+| Granularity | File-level by default. Package-level locking available for refactoring tasks |
+
+Write-set locking prevents two Meeseeks from simultaneously modifying the same files, eliminating the most common class of concurrency conflicts.
+
+### 16.4 Serialized Merge Queue
+
+Meeseeks may execute in parallel, but commits SHALL be serialized through the merge queue. The merge queue processes one approved output at a time:
+
+```
+1. Receive approved output from approval pipeline.
+2. Validate base_snapshot against current HEAD.
+3. If stale: attempt merge or re-queue.
+4. Apply Meeseeks output to a working copy of HEAD.
+5. Run integration checks in validation sandbox.
+6. If integration fails: revert, re-queue task.
+7. If integration passes: commit, update HEAD.
+8. Re-index project via semantic indexer.
+9. Release write-set locks.
+10. Process next item in queue.
+```
+
+This ensures every commit is validated against the actual current state of the project, not a stale snapshot.
+
+---
+
+## 17. Semantic Indexer
+
+### 17.1 Purpose
+
+The semantic indexer maintains a structured, queryable index of the project's code symbols, exports, interfaces, and dependency relationships. It enables the orchestrator to build precise TaskSpecs without needing to read and understand raw source files.
+
+### 17.2 Implementation
+
+The semantic indexer SHALL use tree-sitter for language-aware parsing. It SHALL support at minimum: Go, JavaScript/TypeScript, Python, and Rust.
+
+### 17.3 Index Contents
+
+The index SHALL be stored in SQLite and contain:
+
+| Entry Type | Data |
+|---|---|
+| **Functions** | Name, file, line, parameters, return type, exported/private |
+| **Types/Structs** | Name, file, fields, methods, implements |
+| **Interfaces** | Name, file, method signatures |
+| **Constants/Variables** | Name, file, type, exported/private |
+| **Imports** | File, imported package/module |
+| **Exports** | Package/module, exported symbols |
+| **Dependencies** | Package dependency graph |
+
+### 17.4 Refresh Cycle
+
+The index SHALL be refreshed:
+
+- After project initialization (full index).
+- After each successful commit in the merge queue (incremental index of changed files).
+- On demand via `axiom index refresh`.
+
+### 17.5 Orchestrator Access
+
+The orchestrator SHALL query the index via IPC `query_index` requests. Example queries:
+
+- "What functions does package `auth` export?"
+- "What types implement the `Handler` interface?"
+- "What files import `database/connection.go`?"
+- "Show the dependency graph for module `api`."
+
+This enables precise context construction for TaskSpecs without giving the orchestrator raw filesystem access.
+
+---
+
+## 18. Model Registry
+
+### 18.1 Purpose
 
 The model registry provides orchestrators and sub-orchestrators with current information about all available models, including capabilities, pricing, and recommended use cases.
 
-### 13.2 Sources
+### 18.2 Sources
 
 The registry SHALL aggregate models from two sources:
 
 1. **OpenRouter:** Fetched dynamically via the `/api/v1/models` endpoint.
 2. **BitNet Local:** Scanned from the local BitNet server's loaded models.
 
-### 13.3 Registry Schema
+### 18.3 Registry Schema
 
 Each model entry SHALL contain:
 
 ```json
 {
     "id": "anthropic/claude-4-sonnet",
+    "family": "anthropic",
     "source": "openrouter",
     "tier": "standard",
     "context_window": 200000,
@@ -817,13 +1450,16 @@ Each model entry SHALL contain:
     "weaknesses": ["slow-for-trivial-tasks", "expensive-for-boilerplate"],
     "supports_tools": true,
     "supports_vision": false,
+    "supports_grammar_constraints": false,
     "recommended_for": ["standard-coding", "code-review", "moderate-refactoring"],
     "not_recommended_for": ["simple-renames", "config-changes"],
+    "historical_success_rate": null,
+    "avg_cost_per_task": null,
     "last_updated": "2026-03-15T00:00:00Z"
 }
 ```
 
-### 13.4 Capability Index
+### 18.4 Capability Index
 
 The `strengths`, `weaknesses`, `recommended_for`, and `not_recommended_for` fields SHALL be maintained in a curated `models.json` file shipped with Axiom. This file SHALL be updatable via:
 
@@ -838,135 +1474,173 @@ This command SHALL:
 3. Scan locally available BitNet models.
 4. Merge all sources into the local SQLite registry.
 
-### 13.5 Offline Operation
+### 18.5 Model Performance History
+
+After each project completion, the engine SHALL update `historical_success_rate` and `avg_cost_per_task` for each model used. This enables future orchestrators to prefer models that have historically performed well on the user's codebase style.
+
+### 18.6 Offline Operation
 
 If network access is unavailable during refresh, Axiom SHALL fall back to the last cached registry data in SQLite. A warning SHALL be displayed indicating the data may be stale.
 
-### 13.6 CLI Commands
+### 18.7 CLI Commands
 
 | Command | Description |
 |---|---|
 | `axiom models refresh` | Update registry from all sources |
 | `axiom models list` | Display all registered models |
 | `axiom models list --tier <tier>` | Filter by tier (local, cheap, standard, premium) |
-| `axiom models list --source <source>` | Filter by source (openrouter, local) |
+| `axiom models list --family <family>` | Filter by model family |
 | `axiom models info <model-id>` | Show detailed info for a specific model |
 
 ---
 
-## 14. BitNet Local Inference
+## 19. BitNet Local Inference
 
-### 14.1 Purpose
+### 19.1 Purpose
 
-BitNet provides free, zero-latency local inference for trivial tasks. By breaking work into the smallest possible units, many tasks can be handled by small, 1-bit quantized models running on the user's hardware.
+BitNet provides free, zero-latency local inference for trivial tasks. By breaking work into appropriately-sized units, many simple tasks can be handled by small, 1-bit quantized models running on the user's hardware.
 
-### 14.2 Implementation
+### 19.2 Implementation
 
-Axiom SHALL include BitNet integration using the Microsoft BitNet framework with Falcon3 series models. The BitNet server SHALL run as a host-side service, exposing an OpenAI-compatible API at `http://localhost:3002`.
+Axiom SHALL include BitNet integration using the Microsoft BitNet framework (bitnet.cpp) with Falcon3 series 1.58-bit models. The BitNet server SHALL run as a host-side service, exposing an OpenAI-compatible API at `http://localhost:3002`.
 
-### 14.3 Architecture
+### 19.3 Grammar-Constrained Decoding
+
+To prevent formatting drift and malformed output from 1-bit models, the BitNet server SHALL support **grammar-constrained decoding** (GBNF format, as supported by llama.cpp/bitnet.cpp).
+
+When a task requires structured output (JSON, specific code patterns, function signatures), the engine SHALL include grammar constraints in the inference request. The BitNet server SHALL physically prevent the model from generating tokens outside the specified grammar.
+
+This is critical for local-tier reliability. Without grammar constraints, 1-bit models will produce excessive validation failures that negate their cost advantage.
+
+### 19.4 Architecture
 
 ```
-Worker Container
-  → API call to http://host.docker.internal:3002/v1/chat/completions
-  → BitNet server processes locally
-  → Response returned to container
+Engine receives inference request from Meeseeks via IPC
+  → Engine routes to BitNet server at localhost:3002
+  → BitNet server processes with grammar constraints
+  → Response returned to engine
+  → Engine forwards response to Meeseeks via IPC
 ```
 
-Workers SHALL NOT distinguish between BitNet and OpenRouter responses. The orchestrator's model routing determines which endpoint a worker uses. From the worker's perspective, it is simply calling a model API.
+Meeseeks do not know whether they're talking to BitNet or OpenRouter. The engine's Inference Broker handles routing transparently.
 
-### 14.4 Model Selection
+### 19.5 Resource Management
 
-Axiom SHALL ship with support for the Falcon3 series of 1-bit quantized models. These models are selected for:
+BitNet inference uses local CPU/RAM. The engine SHALL:
+
+- Track BitNet resource usage separately from container concurrency.
+- Apply configurable CPU/memory limits to the BitNet server.
+- Warn the user if combined load (containers + BitNet) exceeds system capacity.
+
+```toml
+# .axiom/config.toml
+[bitnet]
+enabled = true
+host = "localhost"
+port = 3002
+max_concurrent_requests = 4
+cpu_threads = 4
+```
+
+### 19.6 Model Selection
+
+Axiom SHALL ship with support for the Falcon3 series of 1.58-bit quantized models. These models are selected for:
 
 - Small memory footprint (runnable on most consumer hardware)
 - Adequate capability for trivial code tasks (tool calls, renames, simple transforms)
 - Zero API cost
 
-### 14.5 User Control
+### 19.7 User Control
 
 BitNet local inference SHALL be enabled by default. Users MAY disable it:
 
 ```toml
-# .axiom/config.toml
 [bitnet]
 enabled = false
 ```
 
-### 14.6 CLI Commands
+### 19.8 First-Run Setup
+
+On first invocation of `axiom bitnet start`, if no model weights are present, Axiom SHALL download the Falcon3 1-bit weights automatically. The user SHALL be informed of the download size and asked to confirm.
+
+### 19.9 CLI Commands
 
 | Command | Description |
 |---|---|
 | `axiom bitnet start` | Start the local inference server |
 | `axiom bitnet stop` | Stop the local inference server |
-| `axiom bitnet status` | Show server status, loaded model, memory usage |
+| `axiom bitnet status` | Show server status, loaded model, memory usage, active requests |
 | `axiom bitnet models` | List available local models |
-
-### 14.7 First-Run Setup
-
-On first invocation of `axiom bitnet start`, if no model weights are present, Axiom SHALL download the Falcon3 1-bit weights automatically. The user SHALL be informed of the download size and asked to confirm.
 
 ---
 
-## 15. Communication Model
+## 20. Communication Model
 
-### 15.1 Default: Strictly Hierarchical
+### 20.1 Default: Strictly Hierarchical
 
 By default, all communication SHALL be strictly hierarchical:
 
 ```
-User ↔ Orchestrator ↔ Sub-Orchestrators ↔ Workers/Reviewers
+User ↔ Engine ↔ Orchestrator ↔ Sub-Orchestrators
+                                      ↕
+                               Meeseeks / Reviewers
 ```
 
-Workers SHALL NOT communicate with other workers. Reviewers SHALL NOT communicate with workers. All information flows up and down the hierarchy through Axiom's IPC broker.
+Meeseeks SHALL NOT communicate with other Meeseeks. Reviewers SHALL NOT communicate with Meeseeks. All information flows through the engine.
 
-### 15.2 Orchestrator-Granted Lateral Channels
+### 20.2 Orchestrator-Granted Lateral Channels
 
-An orchestrator (or sub-orchestrator) MAY grant explicit lateral communication permission between specific workers. This is intended for cases where two workers need to coordinate (e.g., frontend and backend workers agreeing on an API contract).
+An orchestrator (or sub-orchestrator) MAY request that the engine establish explicit lateral communication permission between specific Meeseeks. This is intended for cases where two Meeseeks need to coordinate (e.g., frontend and backend Meeseeks agreeing on an API contract).
 
 Lateral communication permissions SHALL be:
 
-- **Explicit:** The orchestrator MUST specify which workers may communicate and the scope of communication.
-- **Scoped:** Permissions MAY be granted between specific workers, all workers at the same level, or individual agents at other levels.
-- **Brokered:** All lateral messages SHALL pass through the host-side Axiom engine. Workers do not communicate directly.
-- **Logged:** All lateral messages SHALL be recorded in the SQLite database for audit.
+- **Explicit:** The orchestrator MUST specify which Meeseeks may communicate and the scope.
+- **Scoped:** Permissions MAY be granted between specific Meeseeks, all Meeseeks at the same level, or individual agents at other levels.
+- **Engine-Brokered:** All lateral messages SHALL pass through the Trusted Engine. Meeseeks do not communicate directly.
+- **Logged:** All lateral messages SHALL be recorded in the events table for audit.
 
-### 15.3 IPC Protocol
+### 20.3 IPC Protocol
 
-Communication between the host and containers SHALL use filesystem-based IPC:
+Communication between the engine and containers SHALL use filesystem-based IPC with event notification:
 
 | Direction | Mechanism |
 |---|---|
-| Host → Container | JSON files written to `/workspace/ipc/input/` |
-| Container → Host | JSON files written to `/workspace/ipc/output/` |
+| Engine → Container | JSON files written to `/workspace/ipc/input/` |
+| Container → Engine | JSON files written to `/workspace/ipc/output/` |
 
-The container SHALL poll `/workspace/ipc/input/` at 500ms intervals for new messages. The host SHALL poll container IPC output directories for responses.
+Containers SHALL use `inotify` (Linux) or `fsevents` (macOS) to watch for new IPC files, rather than polling. This eliminates the CPU overhead of 500ms polling across multiple containers.
 
-### 15.4 Message Types
+Fallback: If filesystem watching is unavailable, containers MAY fall back to polling at 1-second intervals.
+
+### 20.4 Message Types
 
 | Type | Direction | Purpose |
 |---|---|---|
-| `task_spec` | Host → Worker | Deliver TaskSpec for execution |
-| `review_spec` | Host → Reviewer | Deliver ReviewSpec for evaluation |
-| `revision_request` | Host → Worker | Return feedback for revision |
-| `task_output` | Worker → Host | Submit completed work |
-| `review_result` | Reviewer → Host | Submit review verdict |
-| `lateral_message` | Worker → Host → Worker | Brokered lateral communication |
-| `shutdown` | Host → Container | Request graceful container shutdown |
+| `task_spec` | Engine → Meeseeks | Deliver TaskSpec for execution |
+| `review_spec` | Engine → Reviewer | Deliver ReviewSpec for evaluation |
+| `revision_request` | Engine → Meeseeks | Return feedback for revision |
+| `task_output` | Meeseeks → Engine | Submit completed work + manifest |
+| `review_result` | Reviewer → Engine | Submit review verdict |
+| `inference_request` | Any Agent → Engine | Request model inference |
+| `inference_response` | Engine → Any Agent | Return inference result |
+| `lateral_message` | Engine ↔ Meeseeks | Brokered lateral communication |
+| `action_request` | Agent → Engine | Request privileged action |
+| `action_response` | Engine → Agent | Return action result |
+| `shutdown` | Engine → Container | Request graceful container shutdown |
 
 ---
 
-## 16. Budget & Cost Management
+## 21. Budget & Cost Management
 
-### 16.1 Budget Configuration
+### 21.1 Budget Configuration
 
 Before starting a project, the user SHALL set a maximum budget:
 
 ```toml
 # .axiom/config.toml
 [budget]
-max_usd = 10.00          # Maximum spend for this project
-warn_at_percent = 80     # Warn when 80% of budget consumed
+max_usd = 10.00
+warn_at_percent = 80
 ```
 
 The user MAY also set the budget via CLI:
@@ -975,95 +1649,83 @@ The user MAY also set the budget via CLI:
 axiom run --budget 10.00 "Build me a REST API for user management"
 ```
 
-### 16.2 Cost Tracking
+### 21.2 Cost Tracking
 
 Axiom SHALL track costs at the following granularity:
 
 | Level | Tracked Data |
 |---|---|
 | Per-request | Model ID, input tokens, output tokens, cost |
-| Per-task | Total cost across all worker + reviewer requests |
-| Per-agent-type | Aggregate cost for workers vs reviewers vs sub-orchestrators |
+| Per-attempt | Total cost for a single task attempt |
+| Per-task | Total cost across all attempts (retries + escalations) |
+| Per-agent-type | Aggregate cost for Meeseeks vs reviewers vs sub-orchestrators |
 | Per-model | Aggregate cost per model used |
 | Per-project | Cumulative total cost |
 
-Cost data SHALL be stored in SQLite:
+Cost data SHALL be stored in the `cost_log` table (see Section 15.2).
 
-```sql
-CREATE TABLE cost_log (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id     TEXT REFERENCES tasks(id),
-    agent_type  TEXT NOT NULL,          -- worker | reviewer | sub_orchestrator
-    model_id    TEXT NOT NULL,
-    input_tokens  INTEGER,
-    output_tokens INTEGER,
-    cost_usd    REAL NOT NULL,
-    timestamp   DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-```
+### 21.3 Budget-Aware Orchestration
 
-### 16.3 Budget-Aware Orchestration
-
-The orchestrator SHALL use the budget to inform decisions:
+The engine SHALL enforce budget limits on every inference request. The orchestrator SHALL use budget information to plan:
 
 1. **Model selection:** When budget is limited, prefer cheaper models and BitNet for more tasks.
-2. **Concurrency:** Reduce parallel workers to slow spend rate if budget is tight.
+2. **Concurrency:** Reduce parallel Meeseeks to slow spend rate if budget is tight.
 3. **Retry limits:** Reduce max retries when budget is constrained.
-4. **Budget reservation:** The orchestrator SHALL reserve at least 20% of the remaining budget for the review pipeline. Spending 100% on workers with nothing left for reviewers SHALL be prevented.
-5. **Budget exhaustion:** When the budget is fully consumed, Axiom SHALL pause execution and prompt the user to either increase the budget or cancel.
+4. **Budget reservation:** The engine SHALL reserve at least 20% of the remaining budget for the review pipeline. The engine SHALL reject Meeseeks inference requests that would leave insufficient budget for reviews.
+5. **Budget exhaustion:** When the budget is fully consumed, the engine SHALL pause execution and prompt the user to either increase the budget or cancel.
 
-### 16.4 Cost Display
+### 21.4 Cost Display
 
 Cost information SHALL be available via:
 
-- `axiom status` — shows current spend, budget remaining, projected total
-- GUI dashboard — real-time cost tracking with per-task breakdown
-- Completion report — final cost summary by category
+- `axiom status` — shows current spend, budget remaining, projected total.
+- GUI dashboard — real-time cost tracking with per-task breakdown.
+- Completion report — final cost summary by category.
 
 ---
 
-## 17. State Management & Crash Recovery
+## 22. State Management & Crash Recovery
 
-### 17.1 State Store
+### 22.1 State Store
 
-All project state SHALL be persisted in SQLite at `.axiom/axiom.db`. This includes:
+All project state SHALL be persisted in SQLite at `.axiom/axiom.db` in WAL mode. This includes all tables defined in Section 15.2.
 
-- Task tree (tasks, dependencies, statuses)
-- Active container metadata (container ID, task ID, started_at)
-- Cost log
-- Model registry cache
-- Project configuration
-- SRS hash for integrity verification
-- Communication log
+### 22.2 Stateless Agents
 
-### 17.2 Stateless Orchestrator
-
-The orchestrator SHALL be stateless with respect to Axiom project state. All state required for orchestration SHALL be readable from SQLite. This means:
+All LLM agents (orchestrator, sub-orchestrators, Meeseeks, reviewers) SHALL be stateless with respect to Axiom project state. All state required for orchestration SHALL be readable from SQLite via the engine. This means:
 
 - An orchestrator can crash and restart without losing progress.
 - A different orchestrator instance can resume a project.
 - The GUI can display accurate state regardless of orchestrator status.
+- The engine is the single source of truth.
 
-### 17.3 Crash Recovery Procedure
+### 22.3 Crash Recovery Procedure
 
-On startup, the Axiom engine SHALL:
+On startup, the engine SHALL:
 
 1. **Kill orphaned containers:** Find any `axiom-*` Docker containers from previous sessions and destroy them.
 2. **Reconcile state:** Identify tasks with status `in_progress` or `in_review` that have no running container. Reset these to `queued`.
-3. **Clean staging:** Remove any staged files that were not committed.
-4. **Resume execution:** The orchestrator reads the task tree from SQLite and resumes from the current state.
+3. **Release stale locks:** Remove any write-set locks held by dead containers.
+4. **Clean staging:** Remove any staged files that were not committed.
+5. **Verify SRS integrity:** Check SRS SHA-256 hash matches stored hash.
+6. **Resume:** The orchestrator reads the task tree from SQLite and resumes from the current state.
 
-### 17.4 Backup
+### 22.4 Event Sourcing
 
-Axiom SHALL NOT implement automated backup. The SQLite database is a single file that the user can back up with standard filesystem tools. The SRS is a markdown file in the project directory. Both are version-controlled alongside the project.
+The `events` table provides a complete, ordered log of every action taken during the project. This enables:
+
+- Post-mortem debugging of failures.
+- Audit trails for security review.
+- Timeline reconstruction in the GUI.
+- Cost analysis and optimization.
 
 ---
 
-## 18. Git Integration
+## 23. Git Integration
 
-### 18.1 Branch Strategy
+### 23.1 Branch Strategy
 
-On project start, Axiom SHALL create a dedicated branch:
+On project start, the engine SHALL create a dedicated branch:
 
 ```
 axiom/<project-slug>
@@ -1071,22 +1733,25 @@ axiom/<project-slug>
 
 All task commits SHALL be made to this branch. The user's current branch SHALL NOT be modified during execution.
 
-### 18.2 Commit Protocol
+### 23.2 Commit Protocol
 
-After a task's output is approved and passes integration checks, Axiom SHALL commit with the following format:
+After a task's output passes the merge queue, the engine SHALL commit with the following format:
 
 ```
 [axiom] <task-title>
 
 Task: <task-id>
 SRS Refs: FR-001, AC-003
-Model: anthropic/claude-4-sonnet (worker), anthropic/claude-4-haiku (reviewer)
+Meeseeks Model: anthropic/claude-4-sonnet
+Reviewer Model: openai/gpt-4o
+Attempt: 2/3
 Cost: $0.0234
+Base Snapshot: abc123d
 ```
 
-### 18.3 Integration Checks
+### 23.3 Integration Checks
 
-After each commit to the project branch, Axiom SHALL run a project-wide integration check:
+The merge queue SHALL run project-wide integration checks in a validation sandbox before every commit:
 
 1. Full build (language-appropriate).
 2. Full test suite (if tests exist).
@@ -1094,11 +1759,12 @@ After each commit to the project branch, Axiom SHALL run a project-wide integrat
 
 If the integration check fails:
 
-1. The commit SHALL be reverted.
-2. The task SHALL be rerouted — a new worker is spawned, potentially with a different approach or model.
-3. The failure details SHALL be included in the new TaskSpec.
+1. The commit SHALL NOT proceed.
+2. The task SHALL be re-queued with the integration failure details included in an updated TaskSpec.
+3. A new Meeseeks SHALL be spawned to resolve the conflict.
+4. If the conflict persists after escalation, the orchestrator SHALL be notified to restructure the affected tasks.
 
-### 18.4 Project Completion
+### 23.4 Project Completion
 
 Upon project completion, the user SHALL:
 
@@ -1108,13 +1774,13 @@ Upon project completion, the user SHALL:
 
 ---
 
-## 19. Claw Integration
+## 24. Claw Integration
 
-### 19.1 Overview
+### 24.1 Overview
 
 Axiom SHALL expose a local API server that Claw-based orchestrators can connect to. This enables users to orchestrate Axiom projects from their Claw conversation (Discord, Telegram, WhatsApp, etc.).
 
-### 19.2 API Server
+### 24.2 API Server
 
 The Axiom API server SHALL run on the host at port 3000 (configurable). It SHALL expose:
 
@@ -1126,20 +1792,26 @@ The Axiom API server SHALL run on the host at port 3000 (configurable). It SHALL
 | `POST` | `/api/v1/projects/:id/run` | Submit prompt and start SRS generation |
 | `POST` | `/api/v1/projects/:id/srs/approve` | Approve the generated SRS |
 | `POST` | `/api/v1/projects/:id/srs/reject` | Reject SRS with feedback |
-| `GET` | `/api/v1/projects/:id/status` | Get project status, task tree, budget |
+| `POST` | `/api/v1/projects/:id/eco/approve` | Approve an ECO |
+| `POST` | `/api/v1/projects/:id/eco/reject` | Reject an ECO |
+| `GET` | `/api/v1/projects/:id/status` | Get project status, task tree, budget, resources |
 | `POST` | `/api/v1/projects/:id/pause` | Pause execution |
+| `POST` | `/api/v1/projects/:id/resume` | Resume execution |
 | `POST` | `/api/v1/projects/:id/cancel` | Cancel execution |
 | `GET` | `/api/v1/projects/:id/tasks` | Get task tree with statuses |
+| `GET` | `/api/v1/projects/:id/tasks/:tid/attempts` | Get attempt history for a task |
 | `GET` | `/api/v1/projects/:id/costs` | Get cost breakdown |
+| `GET` | `/api/v1/projects/:id/events` | Get event log |
 | `GET` | `/api/v1/models` | Get model registry |
+| `GET` | `/api/v1/index/query` | Query semantic index |
 
 **WebSocket:**
 
 | Endpoint | Purpose |
 |---|---|
-| `ws://localhost:3000/ws/projects/:id` | Real-time project events (task completions, reviews, errors, budget warnings) |
+| `ws://localhost:3000/ws/projects/:id` | Real-time project events (task completions, reviews, errors, budget warnings, ECO proposals) |
 
-### 19.3 Authentication
+### 24.3 Authentication
 
 The API server SHALL require authentication via a generated token:
 
@@ -1154,44 +1826,26 @@ All API requests SHALL include the token in the `Authorization` header:
 Authorization: Bearer axm_sk_<random-token>
 ```
 
-### 19.4 Tunnel for Remote Claws
+### 24.4 Tunnel for Remote Claws
 
 For Claw instances running in Docker containers (NanoClaw) or on remote systems, Axiom SHALL support Cloudflare Tunnel:
 
 ```bash
 axiom tunnel start
 # Outputs: https://<random>.trycloudflare.com
-# User provides this URL to their Claw configuration
 ```
 
 For OpenClaw instances running on the same host, the Claw connects directly to `http://localhost:3000`.
 
-### 19.5 Claw Skill
-
-Axiom SHALL generate a Claw skill file that teaches the Claw how to act as an Axiom orchestrator. The skill SHALL:
-
-- Explain the Axiom workflow (prompt → SRS → approval → execution).
-- Provide API endpoint documentation.
-- Include TaskSpec and ReviewSpec templates.
-- Describe the model registry and tier system.
-- Explain budget management.
-- Provide example orchestration workflows.
-
-The skill is generated via:
-
-```bash
-axiom skill generate --runtime claw --output axiom-skill.md
-```
-
 ---
 
-## 20. Skill System
+## 25. Skill System
 
-### 20.1 Purpose
+### 25.1 Purpose
 
 The skill system teaches orchestrator runtimes how to use Axiom. Each supported runtime has a different mechanism for receiving instructions, so Axiom generates runtime-specific skill files.
 
-### 20.2 Supported Runtimes
+### 25.2 Supported Runtimes
 
 | Runtime | Skill Mechanism | Generated Artifact |
 |---|---|---|
@@ -1200,99 +1854,107 @@ The skill system teaches orchestrator runtimes how to use Axiom. Each supported 
 | Codex | System prompt / instructions file | `codex-instructions.md` |
 | OpenCode | System prompt / instructions file | `opencode-instructions.md` |
 
-### 20.3 Skill Content
+### 25.3 Skill Content
 
 All generated skills SHALL include:
 
-1. Axiom workflow overview.
-2. Available CLI commands or API endpoints.
-3. TaskSpec format and construction guidelines.
-4. ReviewSpec format.
-5. Model registry usage and tier descriptions.
-6. Budget management rules.
-7. Task decomposition principles.
-8. Communication model rules.
-9. Error handling and escalation procedures.
+1. Axiom workflow overview (prompt → SRS → approval → execution).
+2. The Trusted Engine vs. Untrusted Agent Plane boundary.
+3. Available API endpoints or IPC request types.
+4. TaskSpec format and construction guidelines.
+5. ReviewSpec format.
+6. Context tier system and minimum-necessary principle.
+7. Model registry usage and tier descriptions.
+8. Budget management rules.
+9. Task decomposition principles (including sizing heuristics).
+10. Communication model rules.
+11. ECO process and valid categories.
+12. Error handling and escalation procedures.
+13. Test authorship separation requirements.
 
-### 20.4 Generation
+### 25.4 Generation
 
 ```bash
 axiom skill generate --runtime <claw|claude-code|codex|opencode>
 ```
 
-Skills SHALL be regenerated when project configuration changes, to ensure the orchestrator always has current information.
+Skills SHALL be regenerated when project configuration changes.
 
 ---
 
-## 21. GUI Dashboard
+## 26. GUI Dashboard
 
-### 21.1 Technology
+### 26.1 Technology
 
-The GUI SHALL be a Wails v2 desktop application (Go backend + React frontend). It provides visual monitoring and control of Axiom projects.
+The GUI SHALL be a Wails v2 desktop application (Go backend + React frontend).
 
-### 21.2 Views
+### 26.2 Views
 
 | View | Content |
 |---|---|
-| **Project Overview** | SRS summary, budget used/remaining, overall progress percentage, elapsed time |
-| **Task Tree** | Hierarchical visualization with status indicators (queued/running/review/done/blocked). Expandable nodes showing TaskSpec details. |
-| **Active Containers** | Live list of running worker and reviewer containers with model, task, duration, and resource usage |
+| **Project Overview** | SRS summary, budget used/remaining, overall progress %, elapsed time, ECO history |
+| **Task Tree** | Hierarchical visualization with status indicators. Expandable nodes showing TaskSpec details, attempt history, and cost. |
+| **Active Containers** | Live list of running Meeseeks and reviewer containers with model, task, duration, CPU/memory usage |
 | **Cost Dashboard** | Spend per task, per model, per agent type, cumulative, projected total. Budget gauge with warning threshold. |
-| **File Diff Viewer** | Side-by-side diff view of worker output vs. existing code. Shows approval status. |
-| **Log Stream** | Real-time log output from active containers and Axiom engine |
-| **Timeline** | Chronological event view — task starts, completions, reviews, commits, errors |
-| **Model Registry** | Browseable model catalog with capabilities, pricing, and usage statistics |
+| **File Diff Viewer** | Side-by-side diff view of Meeseeks output. Shows approval pipeline status. |
+| **Log Stream** | Real-time event log from the engine |
+| **Timeline** | Chronological event view — task starts, completions, reviews, commits, errors, ECOs |
+| **Model Registry** | Browsable model catalog with capabilities, pricing, and historical performance statistics |
+| **Resource Monitor** | System CPU/memory usage, container resource consumption, BitNet server load |
 
-### 21.3 Controls
+### 26.3 Controls
 
 The GUI SHALL provide controls for:
 
 - Starting a new project (prompt input + budget configuration).
 - SRS approval/rejection.
-- Pausing and canceling execution.
+- ECO approval/rejection.
+- Pausing, resuming, and canceling execution.
 - Viewing and modifying budget.
 - Starting/stopping BitNet server.
 - Starting/stopping API tunnel.
 
-### 21.4 Real-Time Updates
+### 26.4 Real-Time Updates
 
-The GUI backend SHALL watch the SQLite database for changes and emit events to the React frontend via Wails event system. Updates SHALL be reflected in the UI within 500ms.
+The engine SHALL emit events via the Wails event system. The React frontend SHALL subscribe to these events and update the UI within 500ms. The GUI SHALL NOT poll SQLite directly — all data comes through engine-emitted events.
 
 ---
 
-## 22. CLI Reference
+## 27. CLI Reference
 
-### 22.1 Project Commands
+### 27.1 Project Commands
 
 | Command | Description |
 |---|---|
 | `axiom init` | Initialize a new Axiom project in the current directory |
 | `axiom run "<prompt>"` | Start a new project: generate SRS, await approval, execute |
 | `axiom run --budget <usd> "<prompt>"` | Start with a specific budget |
-| `axiom status` | Show project status, task tree, active workers, budget |
-| `axiom pause` | Pause execution (finish running tasks, stop spawning new ones) |
+| `axiom status` | Show project status, task tree, active Meeseeks, budget, resources |
+| `axiom pause` | Pause execution |
 | `axiom resume` | Resume a paused project |
 | `axiom cancel` | Cancel execution, kill containers, revert uncommitted changes |
+| `axiom export` | Export project state as human-readable JSON |
 
-### 22.2 Model Commands
+### 27.2 Model Commands
 
 | Command | Description |
 |---|---|
 | `axiom models refresh` | Update model registry from OpenRouter + local |
 | `axiom models list` | List all registered models |
 | `axiom models list --tier <tier>` | Filter by tier |
-| `axiom models info <model-id>` | Show model details |
+| `axiom models list --family <family>` | Filter by model family |
+| `axiom models info <model-id>` | Show model details + historical performance |
 
-### 22.3 BitNet Commands
+### 27.3 BitNet Commands
 
 | Command | Description |
 |---|---|
 | `axiom bitnet start` | Start local inference server |
 | `axiom bitnet stop` | Stop local inference server |
-| `axiom bitnet status` | Show server status and resource usage |
+| `axiom bitnet status` | Show server status, resource usage, active requests |
 | `axiom bitnet models` | List available local models |
 
-### 22.4 API & Tunnel Commands
+### 27.4 API & Tunnel Commands
 
 | Command | Description |
 |---|---|
@@ -1302,52 +1964,65 @@ The GUI backend SHALL watch the SQLite database for changes and emit events to t
 | `axiom tunnel start` | Start Cloudflare Tunnel for remote Claw access |
 | `axiom tunnel stop` | Stop the tunnel |
 
-### 22.5 Skill Commands
+### 27.5 Skill Commands
 
 | Command | Description |
 |---|---|
 | `axiom skill generate --runtime <runtime>` | Generate skill file for specified runtime |
 
-### 22.6 Utility Commands
+### 27.6 Index Commands
+
+| Command | Description |
+|---|---|
+| `axiom index refresh` | Force full re-index of the project |
+| `axiom index query "<query>"` | Query the semantic index |
+
+### 27.7 Utility Commands
 
 | Command | Description |
 |---|---|
 | `axiom version` | Show Axiom version |
-| `axiom doctor` | Check system requirements (Docker, BitNet, network) |
-| `axiom export` | Export project state as human-readable JSON |
+| `axiom doctor` | Check system requirements (Docker, BitNet, network, resources) |
 
 ---
 
-## 23. Project Directory Structure
+## 28. Project Directory Structure
 
-### 23.1 Axiom Project Structure
+### 28.1 Axiom Project Structure
 
 ```
 project-root/
 ├── .axiom/
-│   ├── axiom.db                    # SQLite database (all state)
+│   ├── axiom.db                    # SQLite database (all state, WAL mode)
 │   ├── config.toml                 # Project configuration
-│   ├── srs.md                      # Accepted SRS (immutable after approval)
+│   ├── srs.md                      # Accepted SRS (immutable after approval, read-only permissions)
+│   ├── srs.md.sha256               # SRS integrity hash
 │   ├── task-tree.md                # Human-readable task decomposition
 │   ├── models.json                 # Curated model capability index
 │   ├── containers/
 │   │   ├── specs/                  # Generated TaskSpecs and ReviewSpecs
 │   │   │   └── <task-id>/
 │   │   │       └── spec.md
-│   │   ├── staging/                # Worker output staging areas
+│   │   ├── staging/                # Meeseeks output staging areas
 │   │   │   └── <task-id>/
-│   │   │       └── <output files>
+│   │   │       ├── <output files>
+│   │   │       └── manifest.json
 │   │   └── ipc/                    # IPC communication directories
 │   │       └── <task-id>/
 │   │           ├── input/
 │   │           └── output/
+│   ├── validation/                 # Validation sandbox working directories
+│   ├── eco/                        # Engineering Change Order records
+│   │   └── ECO-001.md
 │   └── logs/
-│       └── axiom.log               # Engine log
+│       ├── engine.log              # Engine log
+│       └── prompts/                # Opt-in prompt/response logging
+│           └── <task-id>-<attempt>.json
 ├── src/                            # Project source code (managed by Axiom)
 ├── ...
 ```
 
-### 23.2 Global Configuration
+### 28.2 Global Configuration
 
 ```
 ~/.axiom/
@@ -1360,110 +2035,196 @@ project-root/
 
 ---
 
-## 24. Security Model
+## 29. Security Model
 
-### 24.1 Threat Model
+### 29.1 Threat Model
 
-The primary threat is a misbehaving AI agent (particularly a cheap/local model) executing harmful operations on the user's system. Axiom mitigates this through defense-in-depth:
+Axiom operates in a threat environment with multiple attack surfaces. The primary threats are:
 
-### 24.2 Security Layers
+| Threat | Vector | Severity |
+|---|---|---|
+| **Misbehaving AI agent** | Container escape, resource abuse | High |
+| **Malicious generated code** | Tests, build scripts, package hooks executed during validation | Critical |
+| **Prompt injection** | Repo files/comments injected into AI prompts | High |
+| **Dependency supply-chain** | Malicious packages pulled during build/test | High |
+| **Path traversal** | Staged output with `../` paths or symlinks | High |
+| **Data exfiltration** | Agent sending project data to model provider | Medium |
+| **Budget abuse** | Agent making excessive/unauthorized API calls | Medium |
+| **Secret exposure** | API keys, tokens leaked during build/test | High |
+| **API/tunnel misuse** | Unauthorized access to Axiom API server | Medium |
+| **SRS tampering** | Agent attempting to modify locked SRS | Medium |
+
+### 29.2 Security Layers
 
 | Layer | Threat Mitigated | Mechanism |
 |---|---|---|
-| Docker isolation | Agent escapes to host filesystem | Separate filesystem/process/network namespace |
-| No project mount | Agent corrupts project code | Project filesystem never mounted in containers |
-| Staging + approval | Bad code reaches production | Multi-gate approval pipeline (automated + reviewer + orchestrator) |
-| Credential proxy | API key theft | Keys never enter container environment |
-| Network restriction | Data exfiltration | Only proxy and BitNet ports reachable |
-| Non-root execution | Privilege escalation | Container runs as unprivileged user |
-| Timeout enforcement | Resource exhaustion | Hard kill after configurable timeout |
-| Budget ceiling | Cost runaway | Execution pauses when budget exhausted |
-| Integration checks | Breaking changes | Full build + test after every commit |
+| Docker isolation | Agent escape | Separate filesystem/process/network namespace |
+| No project mount | Project corruption | Project filesystem never mounted in agent containers |
+| No network access | Data exfiltration, unauthorized API calls | Containers have no outbound network |
+| Engine-mediated inference | Budget abuse, model misuse | All API calls go through engine with per-task limits |
+| Validation sandbox | Malicious generated code | Build/test/lint runs in isolated container, not on host |
+| No secrets in sandbox | Secret exposure | Validation sandbox has no API keys, tokens, or credentials |
+| Network-free validation | Supply-chain attacks | Validation sandbox has no network; dependencies from lockfile/cache only |
+| Output manifest | Path traversal, unauthorized writes | All file ops declared in manifest; engine validates paths |
+| Path canonicalization | Symlink/traversal attacks | Engine resolves and rejects symlinks, `..`, devices, FIFOs |
+| Output path allowlist | Scope violation | Meeseeks can only modify files within declared target scope |
+| File op via manifest | Unsafe deletions/renames | Deletions and renames must be declared, not raw filesystem |
+| Resource limits | Resource exhaustion | CPU, memory, timeout caps per container |
+| Budget ceiling | Cost runaway | Engine pauses on budget exhaustion |
 | Branch isolation | Main branch corruption | All work on `axiom/<slug>` branch |
+| SRS integrity hash | SRS tampering | SHA-256 verification on every engine startup |
+| API authentication | Tunnel/API misuse | Token-based auth on all API endpoints |
+| Prompt sanitization | Prompt injection | Repo content treated as untrusted in prompt construction |
+| Event logging | Audit, forensics | Every action recorded in events table |
+| Risky file escalation | Sensitive file manipulation | CI configs, auth code, etc. require elevated review |
 
-### 24.3 Trust Boundaries
+### 29.3 Trust Boundaries
 
 ```
-TRUSTED (host):
-  - Axiom engine
-  - Orchestrator (when running on host)
-  - Credential proxy
-  - BitNet server
-  - Project filesystem
+TRUSTED (host, engine):
+  - Axiom Go engine
   - SQLite database
+  - Project filesystem
+  - Git operations
+  - Inference Broker
+  - BitNet server
+  - API server
+  - Semantic indexer
+  - Merge queue
 
 UNTRUSTED (containers):
-  - Workers
+  - Orchestrator LLM
+  - Sub-orchestrator LLMs
+  - Meeseeks
   - Reviewers
-  - Sub-orchestrators
+  - Validation sandbox (contains untrusted code)
+
+UNTRUSTED (external):
+  - Model providers (OpenRouter) — receive prompt data
+  - Generated code artifacts — treated as untrusted until committed
+  - Repository content — treated as untrusted input for prompts
 ```
 
-All data crossing the trust boundary (container → host) SHALL pass through the approval pipeline. No container output SHALL be written to the project filesystem without validation.
+All data crossing the trust boundary (container → host) SHALL pass through the engine's validation and approval pipeline. No container output SHALL be written to the project filesystem without manifest validation, sandbox testing, review, and orchestrator approval.
+
+### 29.4 File Safety Rules
+
+The engine SHALL enforce the following rules on all staged output:
+
+1. **Canonicalize all paths:** Resolve to absolute paths within the expected output scope.
+2. **Reject symlinks:** No symbolic links in staged output.
+3. **Reject device files and FIFOs:** Only regular files permitted.
+4. **Reject oversized files:** Configurable max file size (default: 1MB).
+5. **Validate manifest completeness:** Every file in staging must be in manifest; every manifest entry must exist.
+6. **Scope enforcement:** Staged files must match the task's declared `target_files` scope.
+7. **Deletion safety:** File deletions only via manifest declaration, never raw filesystem operations.
 
 ---
 
-## 25. Error Handling & Escalation
+## 30. Error Handling & Escalation
 
-### 25.1 Worker Failure Escalation
+### 30.1 Meeseeks Failure Escalation
 
-When a worker fails to produce acceptable output, the following escalation SHALL be applied:
+When a Meeseeks fails to produce acceptable output, the following escalation SHALL be applied:
 
 ```
 Tier 1: RETRY (same model)
-  - Worker receives error feedback.
-  - Worker revises and resubmits.
+  - Meeseeks receives error feedback via IPC.
+  - Meeseeks revises and resubmits (same container).
   - Max 3 retries at the same model tier.
 
 Tier 2: ESCALATE (better model)
+  - Current Meeseeks container is destroyed.
   - Task is reassigned to the next higher model tier.
-  - New worker container is spawned with the original TaskSpec + failure history.
+  - New Meeseeks container is spawned with original TaskSpec + failure history.
   - Max 2 escalations (e.g., local → cheap → standard).
 
 Tier 3: BLOCK (orchestrator intervention)
   - Task is marked BLOCKED.
-  - Orchestrator is notified with full failure history.
+  - Orchestrator is notified via IPC with full failure history.
   - Orchestrator MAY:
     a. Restructure the task (break into smaller subtasks).
     b. Provide additional context to the TaskSpec.
-    c. Manually resolve the task.
-    d. Flag the task for user attention.
+    c. Escalate to premium tier.
+    d. File an ECO if the issue is environmental.
+    e. Flag the task for user attention.
 ```
 
-### 25.2 Integration Failure
+### 30.2 Integration Failure
 
-When a committed task breaks the project-wide integration check:
+When a committed task breaks the project-wide integration check in the merge queue:
 
-1. The commit SHALL be reverted.
-2. The task SHALL be re-queued with the integration failure details included in the TaskSpec.
-3. A new worker SHALL be spawned to resolve the conflict.
-4. If the conflict persists after escalation, the orchestrator SHALL be notified to restructure the affected tasks.
+1. The commit SHALL NOT proceed.
+2. The task SHALL be re-queued with the integration failure details.
+3. A new Meeseeks SHALL be spawned with updated context from the semantic indexer.
+4. If the conflict persists after escalation, the orchestrator SHALL restructure the affected tasks.
 
-### 25.3 Budget Exhaustion
+### 30.3 Budget Exhaustion
 
 When the project budget is fully consumed:
 
 1. All active containers SHALL be allowed to complete their current work.
-2. No new workers SHALL be spawned.
+2. No new Meeseeks SHALL be spawned.
 3. The user SHALL be notified with a cost summary and progress report.
 4. The user MAY increase the budget to resume execution.
 5. The user MAY cancel the project.
 
-### 25.4 Orchestrator Failure
+### 30.4 Orchestrator Failure
 
 If the orchestrator crashes or disconnects:
 
 1. Running containers SHALL continue until their timeout expires.
-2. Axiom engine SHALL persist all state to SQLite.
-3. On orchestrator reconnection, it SHALL resume from persisted state (see Section 17.3).
+2. The engine SHALL persist all state to SQLite.
+3. On orchestrator reconnection, it SHALL resume from persisted state (see Section 22.3).
 
-### 25.5 Docker Daemon Failure
+### 30.5 Docker Daemon Failure
 
 If the Docker daemon becomes unavailable:
 
 1. `axiom doctor` SHALL detect this condition.
-2. Axiom SHALL NOT attempt to spawn new containers.
+2. The engine SHALL NOT attempt to spawn new containers.
 3. The user SHALL be notified to restart Docker.
-4. Running containers may be lost — Axiom SHALL reconcile state on recovery (see Section 17.3).
+4. On recovery, the engine SHALL run crash recovery (Section 22.3).
+
+---
+
+## 31. Observability & Prompt Logging
+
+### 31.1 Purpose
+
+Debugging why a Meeseeks failed three times requires visibility into what was sent to the model and what came back. Prompt logging provides this capability.
+
+### 31.2 Configuration
+
+Prompt logging is **opt-in** for privacy:
+
+```toml
+# .axiom/config.toml
+[observability]
+log_prompts = false          # Set to true to capture full prompts + responses
+log_token_counts = true      # Always log token counts (no content)
+```
+
+### 31.3 What Is Logged
+
+When `log_prompts = true`:
+
+| Data | Storage Location |
+|---|---|
+| Full prompt sent to model | `.axiom/logs/prompts/<task-id>-<attempt>.json` |
+| Full model response | Same file |
+| Model ID and parameters | Same file |
+| Token counts | Same file + `task_attempts` table |
+| Latency | Same file |
+
+When `log_prompts = false`:
+
+- Only token counts, model ID, cost, and latency are recorded (in `task_attempts` table).
+- No prompt or response content is stored.
+
+### 31.4 Retention
+
+Prompt logs SHALL be stored in the project directory and are subject to the user's own backup and retention policies. Axiom SHALL NOT automatically delete prompt logs.
 
 ---
 
@@ -1481,7 +2242,7 @@ max_usd = 10.00
 warn_at_percent = 80
 
 [concurrency]
-max_workers = 10
+max_meeseeks = 10
 
 [orchestrator]
 runtime = "claw"                        # claw | claude-code | codex | opencode
@@ -1491,11 +2252,23 @@ srs_approval_delegate = "user"          # user | claw
 enabled = true
 host = "localhost"
 port = 3002
+max_concurrent_requests = 4
+cpu_threads = 4
 
 [docker]
-image = "axiom-worker:latest"
+image = "axiom-meeseeks-multi:latest"
 timeout_minutes = 30
-network_mode = "bridge"
+cpu_limit = 0.5
+mem_limit = "2g"
+network_mode = "none"
+
+[validation]
+timeout_minutes = 10
+cpu_limit = 1.0
+mem_limit = "4g"
+network = "none"
+allow_dependency_install = true
+security_scan = false
 
 [git]
 auto_commit = true
@@ -1503,6 +2276,10 @@ branch_prefix = "axiom"
 
 [api]
 port = 3000
+
+[observability]
+log_prompts = false
+log_token_counts = true
 ```
 
 ---
@@ -1512,17 +2289,25 @@ port = 3000
 | Term | Definition |
 |---|---|
 | **SRS** | Software Requirements Specification — the immutable project definition document |
-| **TaskSpec** | Self-contained task description delivered to a worker |
-| **ReviewSpec** | Task description + worker output delivered to a reviewer |
-| **Orchestrator** | Top-level agent responsible for project lifecycle |
-| **Sub-Orchestrator** | Delegated agent managing a subtree of tasks |
-| **Worker** | Disposable agent that executes a single TaskSpec |
-| **Reviewer** | Disposable agent that evaluates worker output |
-| **File Router** | System that brokers files from containers to project filesystem |
-| **Model Registry** | Catalog of available AI models with capabilities and pricing |
+| **ECO** | Engineering Change Order — controlled process for environmental adaptations |
+| **TaskSpec** | Self-contained task description delivered to a Meeseeks |
+| **ReviewSpec** | Task description + Meeseeks output delivered to a reviewer |
+| **Trusted Engine** | Go control plane that performs all privileged operations |
+| **Untrusted Agent Plane** | All LLM agents running in Docker containers |
+| **Inference Broker** | Engine component that mediates all model API calls |
+| **Orchestrator** | Top-level LLM agent responsible for project lifecycle |
+| **Sub-Orchestrator** | Delegated LLM agent managing a subtree of tasks |
+| **Meeseeks** | Disposable worker agent that executes a single TaskSpec and is destroyed (named after Mr. Meeseeks from Rick and Morty) |
+| **Reviewer** | Disposable agent that evaluates Meeseeks output |
+| **Validation Sandbox** | Isolated Docker container for running build/test/lint against untrusted code |
+| **File Router** | System that brokers files from containers to project filesystem via approval pipeline |
+| **Merge Queue** | Serialized commit pipeline that prevents stale-context conflicts |
+| **Semantic Indexer** | tree-sitter-based code index for precise context construction |
+| **Model Registry** | Catalog of available AI models with capabilities, pricing, and history |
 | **BitNet** | Local 1-bit quantized inference engine for trivial tasks |
 | **Claw** | AI assistant platform (OpenClaw/NanoClaw) used as recommended orchestrator |
-| **Credential Proxy** | Host-side service that injects API keys into container requests |
-| **IPC** | Inter-Process Communication via filesystem between host and containers |
-| **Tier** | Model complexity classification (local, cheap, standard, premium) |
-| **Gate** | Approval checkpoint in the file router pipeline |
+| **Base Snapshot** | Git SHA that a TaskSpec was generated against |
+| **Write-Set Lock** | File-level lock preventing concurrent modification |
+| **Output Manifest** | JSON declaration of all file operations a Meeseeks performed |
+| **Grammar Constraints** | GBNF rules that restrict model output to valid syntax |
+| **Context Tier** | Level of project context provided to a Meeseeks (symbol, file, package, repo-map) |
