@@ -1,0 +1,427 @@
+Overall: this is a strong concept doc, but I would not treat it as implementation-ready yet.
+
+The good news is that the core instincts are right: lock requirements before execution, keep workers disposable, separate generation from review, track costs explicitly, and make traceability first-class. That is a much better starting point than most “multi-agent coding platform” designs.
+
+The bad news is that the current design has a few foundational problems that will hurt safety, correctness, and operability unless you resolve them first.
+
+## My verdict
+
+This reads like a strong **product vision** and a weaker **executable architecture**.
+
+The two most important issues are:
+
+1. **Your trust boundary collapses during validation.**
+   You isolate workers, then you compile/test/lint their untrusted output in the trusted environment. That means malicious or simply bad generated code can still execute on the host via test runners, build hooks, package install scripts, linters, codegen, Makefiles, etc.
+
+2. **“Orchestrator” is doing two different jobs in the document.**
+   Sometimes it is an LLM agent/runtime. Sometimes it is a privileged host control plane with filesystem, git, budget, and lifecycle authority. That ambiguity will make the system hard to implement safely.
+
+If you fix only those two things, the design gets much stronger.
+
+---
+
+## What is already strong
+
+Your best ideas are:
+
+* **SRS approval gate + traceability.** Tying tasks to `FR-*` / `AC-*` is excellent.
+* **Disposable workers and reviewers.** Good for context hygiene.
+* **Branch isolation.** Much safer than direct edits to the user’s working branch.
+* **Budget as a first-class system concern.** Most agent systems ignore this until too late.
+* **Crash recovery and persistent state.** Good instinct to center the engine around SQLite.
+
+Those are real strengths. I would keep them.
+
+---
+
+## Critical gaps and issues
+
+### 1. You protected the host from agents, but not from generated code
+
+This is the biggest problem in the document.
+
+Workers are untrusted. Reviewers are untrusted. Good.
+But then the host runs:
+
+* compilation
+* linting
+* unit tests
+* full integration tests
+
+against their output.
+
+That means the actual dangerous thing is not the worker process. It is the **artifact** it produces.
+
+A malicious or broken task can hide execution in:
+
+* test files
+* package hooks
+* build scripts
+* generator scripts
+* linters/plugins
+* dependency installs
+* repo config
+
+So the architecture currently says “containers are untrusted,” while the most dangerous execution path is still trusted.
+
+**Fix:** introduce a second sandbox class.
+
+* **Authoring sandbox**: where workers/reviewers operate.
+* **Validation sandbox**: where staged output is compiled/tested/linted.
+
+The validation sandbox should have:
+
+* no project secrets
+* no outbound network by default
+* resource limits
+* read-only base snapshot + writable overlay
+* explicit dependency/network allowlists if needed
+
+Never run untrusted build/test flows directly on the user’s host.
+
+---
+
+### 2. The engine and the orchestrator need to be split cleanly
+
+Right now the document mixes together:
+
+* an LLM that reasons about SRS, tasks, escalation, and review
+* a trusted controller that writes files, commits git changes, enforces budget, spawns containers, and manages state
+
+Those should not be the same conceptual component.
+
+A remote Claw cannot literally be “the only entity with access to the project filesystem.” The host engine has that access. The Claw may decide, recommend, or approve, but the engine performs the action.
+
+**Fix:** define two separate layers.
+
+* **Trusted Engine / Control Plane**
+
+  * SQLite state machine
+  * git
+  * file routing
+  * validation
+  * budget enforcement
+  * model access policy
+  * container lifecycle
+  * lock/merge handling
+
+* **Untrusted Agent Plane**
+
+  * orchestrator LLM
+  * sub-orchestrator LLMs
+  * workers
+  * reviewers
+
+LLMs should propose structured decisions. The engine should enforce them.
+
+That one change will also make crash recovery, auditability, and security much clearer.
+
+---
+
+### 3. The credential proxy is not a sufficient security boundary
+
+The current design allows untrusted containers to reach a host-side proxy that injects real API keys.
+
+That protects the key itself, but not the system.
+
+An untrusted worker can still:
+
+* exfiltrate anything visible in its prompt/context to the model provider
+* burn budget with arbitrary calls
+* call disallowed models
+* send very large prompts
+* loop on retries until capped
+
+So the proxy solves “hide the API key,” but not “control what the container is allowed to do.”
+
+**Fix:** the safest design is: **containers do not call model providers directly at all**.
+
+Instead, the host engine owns all inference requests. If you keep the proxy model, then at minimum add:
+
+* per-task scoped credentials
+* request signing
+* model allowlists
+* max token caps
+* rate limits
+* per-task spend limits
+* prompt size caps
+* audit logs
+* hard kill switch on budget breach
+
+---
+
+### 4. Concurrency is underspecified where it matters most: writes and stale context
+
+The design supports up to 10 concurrent workers, but it does not define how to prevent them from stepping on each other.
+
+Problems you will hit:
+
+* two tasks edit the same file
+* two tasks edit different files but depend on a shared interface
+* TaskSpec was created against stale code
+* a task passes checks against one snapshot, then fails when merged onto latest HEAD
+
+The current pipeline writes approved files to the project filesystem and commits them, but it does not define:
+
+* file ownership / locks
+* base snapshot pinning
+* three-way merge behavior
+* revalidation against current HEAD
+* output path allowlists
+* conflict resolution policy
+
+**Fix:** every task attempt should be pinned to a `base_snapshot` or `git_sha`, and the scheduler should enforce a write set / lock set for likely affected files or modules. Promotion should go through a serialized merge queue with revalidation.
+
+Without that, concurrency will create false failures and corrupted integration state.
+
+---
+
+### 5. “Minimal context” is directionally right but too absolute
+
+Your diagnosis is good: too much context causes hallucination and drift.
+Your remedy is too strict: “workers get only inline snippets and no repo access.”
+
+That will fail on real codebases.
+
+Many tasks require:
+
+* existing patterns from nearby modules
+* repo-wide type/interface usage
+* naming conventions
+* imports and package structure
+* hidden coupling outside the snippet
+* current contents of related files
+
+So the problem is not “too much context.”
+The problem is “too much **unstructured** context.”
+
+**Fix:** replace “minimum context” with “minimum necessary structured context.”
+
+Give workers tiered read-only context options such as:
+
+* symbol-level context
+* file-level context
+* package/module-level context
+* repo map / dependency graph
+* indexed snapshot query access
+
+Do not give raw write access to the repo, but do give better read access than pasted snippets.
+
+---
+
+### 6. Absolute SRS immutability will become operationally painful
+
+I understand why you want this. It directly addresses the “misinterpretation loop.”
+
+But the current rule is too rigid:
+
+* user cannot alter requirements mid-run
+* if the SRS is wrong, cancel and restart
+* no requirement changes after approval
+
+In real implementation, new facts appear:
+
+* dependency limitations
+* API/provider constraints
+* security findings
+* performance realities
+* ambiguous requirements becoming concrete
+
+If there is no change process, you force expensive restarts and waste already-valid work.
+
+**Fix:** keep immutability, but make it **versioned immutability**.
+
+Example:
+
+* `SRS v1` approved
+* later: `Change Request CR-001`
+* approved delta becomes `SRS v1 + addendum A`
+* tasks are replanned only within affected scope
+
+That preserves traceability without making the system brittle.
+
+---
+
+### 7. The task sizing strategy may optimize for cheap models but hurt throughput
+
+You say leaf tasks should be “the smallest completable unit” and that every task gets a reviewer.
+
+That combination will create a lot of overhead:
+
+* more orchestration
+* more retries
+* more reviews
+* more git commits
+* more integration runs
+* more context packaging
+
+For many repos, coordination cost will dominate generation cost.
+
+The better target is not “smallest possible.” It is:
+
+> small enough to be reliable, large enough to preserve coherence
+
+**Fix:** define task sizing heuristics around:
+
+* expected changed files
+* interface surface area
+* estimated validation cost
+* likelihood of merge conflict
+* whether the task needs holistic reasoning
+
+Also allow batched review for trivial changes.
+
+---
+
+### 8. The review model is too LLM-centric and too easy to rubber-stamp
+
+A worker produces code.
+A reviewer LLM reads the code and approves it.
+Then the orchestrator LLM validates against the SRS.
+
+That is three intelligence layers, but still weak evidence if the acceptance criteria are not executable.
+
+Also, if worker and reviewer are similar model families, you risk correlated blind spots and rubber-stamping.
+
+And if the worker also generated the tests, “tests passed” is not strong proof.
+
+**Fix:**
+
+* prioritize deterministic checks over agent judgment
+* use acceptance harnesses not authored by the same worker when possible
+* diversify reviewer model family on risky tasks
+* require stricter policy for risky file types:
+
+  * CI config
+  * package manifests
+  * lockfiles
+  * scripts
+  * auth/security code
+  * infra definitions
+
+---
+
+### 9. Your data model is too thin for retries, audits, and recovery
+
+The schema is a decent start, but it will not carry the lifecycle you describe.
+
+Specific problem: `tasks` is trying to store both the durable task identity and the current execution attempt. That loses history.
+
+Also `srs_refs` as comma-separated text is a schema smell.
+
+You need separate tables for things like:
+
+* `task_attempts`
+* `task_srs_refs`
+* `validation_runs`
+* `review_runs`
+* `task_artifacts`
+* `task_locks`
+* `events`
+* `messages`
+* `container_sessions`
+
+Each attempt should track:
+
+* base snapshot / git sha
+* model used
+* prompt/template version
+* start/end timestamps
+* cost
+* failure reason
+* feedback history
+* artifact hashes
+
+Without that, crash recovery will be coarse and audits will be weak.
+
+---
+
+### 10. The security model is missing several real threats
+
+The threat model focuses on “misbehaving AI agent inside a container.”
+That is only one threat.
+
+Missing or under-specified threats include:
+
+* prompt injection from repo files/comments
+* malicious generated tests/scripts executed during validation
+* dependency supply-chain risk
+* path traversal/symlink attacks in staging output
+* unsafe file deletions/renames
+* secret exposure during build/test
+* remote API/tunnel misuse
+* provider rate-limit and spend abuse
+* model prompt provenance/privacy when using conversation context
+
+You need explicit controls for all of those.
+
+A few examples:
+
+* canonicalize all staged paths
+* reject symlinks, devices, FIFOs, oversized files
+* allowlist output paths
+* represent deletes/renames via explicit manifest, not raw filesystem behavior
+* default builds/tests to no secrets and no network
+* treat repo content as untrusted input in prompts
+
+---
+
+## Internal contradictions or ambiguities
+
+A few places where the doc disagrees with itself or is too fuzzy:
+
+* **“100% Local Execution”** is not accurate if OpenRouter, Cloudflare Tunnel, and remote Claws are part of normal operation. Call it “local control plane with optional external inference.”
+* The Dockerfile shown does not demonstrate the claim that **Go, Python, and Node are available by default**. The spec and image need to match.
+* **BitNet tasks not counting against concurrency** ignores local CPU/RAM contention.
+* **Sub-orchestrators can manage workers and permissions**, but they are also defined as untrusted containers. Those powers should be engine-enforced, not self-executed.
+* The GUI section implies **watching SQLite for changes**. I would make the engine emit events and let the UI subscribe, rather than making the DB the UI signaling mechanism.
+* **Delegated SRS approval to the Claw** conflicts with the philosophy that the user explicitly locks the scope. At minimum, provenance and imported assumptions need to be surfaced to the user.
+
+---
+
+## What I would change before building
+
+If this were my project, I would make these the mandatory design changes for v1:
+
+1. **Split the architecture into Trusted Engine vs Untrusted Agent Plane.**
+2. **Add a dedicated validation sandbox.**
+3. **Move all model/provider access to the host side.**
+4. **Add base snapshots, write locks, and a merge queue.**
+5. **Replace hard SRS immutability with versioned addenda/change requests.**
+6. **Expand the state model to track attempts, artifacts, validation, and events.**
+7. **Reduce v1 scope.**
+
+That last point matters. Right now this doc is trying to ship:
+
+* autonomous coding engine
+* multi-agent hierarchy
+* local inference
+* remote tunnel/API
+* multiple orchestrator runtimes
+* GUI
+* skill generation
+
+That is a lot. I would strongly consider an MVP with:
+
+* one trusted engine
+* one orchestrator mode
+* workers + reviewers
+* sandboxed validation
+* git integration
+* budget tracking
+
+Then add sub-orchestrators, Claw tunnel, and BitNet after the core loop is solid.
+
+---
+
+## Bottom line
+
+This is a promising architecture, but I would move it from **“Approved”** to **“Needs design revision”** before implementation.
+
+The central idea is good. The current weak spots are mostly in the **control-plane boundary**, **artifact safety**, **concurrency correctness**, and **change-management model**.
+
+The single sentence summary is:
+
+> You’ve designed strong agent isolation, but you have not yet designed equally strong artifact isolation and control-plane authority.
+
+The best next step is to rewrite Sections 3, 10, 11, 17, and 24 around a clear **trusted engine / untrusted agents / separate validation sandbox** model.
