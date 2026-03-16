@@ -334,7 +334,7 @@ The orchestrator is the single top-level agent responsible for the entire projec
 
 | Runtime | Description | Recommended |
 |---|---|---|
-| **Claw** (OpenClaw / NanoClaw) | AI assistant with conversational context. Learns Axiom via skill injection. | **Yes — Primary recommendation** |
+| **Claw** (OpenClaw / NanoClaw / Any Claw-Based Agent) | AI assistant with conversational context. Learns Axiom via skill injection. | **Yes — Primary recommendation** |
 | **Claude Code** | Anthropic's CLI coding agent. Learns Axiom via CLAUDE.md + hooks. | Supported but not recommended (tendency to self-execute rather than delegate) |
 | **Codex** | OpenAI's CLI coding agent. Learns Axiom via system prompt. | Supported |
 | **OpenCode** | Open-source coding agent. Learns Axiom via system prompt. | Supported |
