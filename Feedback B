@@ -1,37 +1,35 @@
-This is an exceptionally well-thought-out architecture document. You’ve directly targeted the most painful failure modes of current agentic coding frameworks: context window degradation (hallucinations), the "misinterpretation loop" of infinite prompt tweaking, and API cost creep. The Dockerized, minimal-context worker approach is exactly the right paradigm to solve these issues.
+This Version 2.0 architecture is phenomenally robust. You didn't just patch the holes; you fundamentally hardened the system.
 
-However, looking at the system flow and state management, there are a few architectural gaps and potential bottlenecks that will likely emerge once you start pushing complex projects through it.
+The division between the **Trusted Engine** (Control Plane) and the **Untrusted Agent Plane** is exactly the right paradigm for agentic frameworks. Moving privileged operations out of the LLM's hands and into a deterministic Go engine instantly elevates this above 90% of the open-source agent tools out there.
 
-Here is my analysis of the gaps and potential issues in the Axiom architecture:
+The "Meeseeks" nomenclature is also a brilliant touch—it perfectly communicates the disposable, single-purpose lifecycle of the workers.
 
-### 1. The Parallel Execution vs. Serialized Commit Trap (Race Conditions)
+However, looking at the queueing mechanics and system operations, introducing strict locking and isolated validation stages creates a few new friction points. Here are the gaps in v2.0 that will likely surface when the system is under load:
 
-**The Issue:** You allow up to 10 concurrent workers (Section 4.2). If Worker A and Worker B are executing in parallel on independent tasks, they both receive `TaskSpecs` based on the *current* state of the project. If Worker A finishes, passes review, and commits to the `axiom/<slug>` branch, the project state has changed. When Worker B finishes 10 seconds later, its output was generated against a stale context.
-**The Risk:** Git might auto-merge cleanly if they touched different files, but *semantic* conflicts will slip through. The Stage 5 Integration Check (Section 11.2) will catch the failure, but reverting Worker B's commit and rerouting the task wastes time and budget on an error caused by the orchestrator's concurrency model, not the worker.
-**Recommendation:** Implement a **Serialized Merge Queue**. Workers can execute and stage files in parallel, but orchestrator validation, commits, and integration checks must be queued and processed serially. Alternatively, generate an AST (Abstract Syntax Tree) hash of the files a worker is meant to touch, and lock those branches of the AST during execution.
+### 1. Write-Set Lock Deadlocks
 
-### 2. Context Propagation & The Indexing Gap
+**The Issue:** Section 16.3 implements write-set locking to prevent concurrent modifications. However, if the orchestrator dispatches Meeseeks A to modify `auth.go` and `user.go`, and Meeseeks B to modify `user.go` and `profile.go`, you risk a classic system deadlock if they don't acquire those locks simultaneously or in a deterministic order.
+**The Risk:** If A locks `auth.go` and waits for `user.go`, while B locks `user.go` and waits for `auth.go`, both tasks hang indefinitely in the `queued` or `in_progress` state, consuming resources and freezing the task tree.
+**Recommendation:** The Trusted Engine must enforce a **Deterministic Lock Acquisition Order** (e.g., alphabetically by canonical file path). Furthermore, lock acquisition must be atomic—a task must acquire *all* its required locks at once before spawning the Meeseeks container, or it acquires none and yields back to the queue.
 
-**The Issue:** Section 8.3 states workers receive "only the specific files and/or code snippets the worker needs." But how does the Orchestrator know *what* those snippets are, especially for code that was just written by another worker 30 seconds ago?
-**The Risk:** If Worker A writes `auth.go` and Worker B needs to write `user_handler.go` which depends on `auth.go`, the Orchestrator needs to accurately slice the newly written `auth.go` to inject into Worker B's `TaskSpec`. LLMs acting as orchestrators are bad at grepping large files reliably to extract context.
-**Recommendation:** Introduce a **Semantic Indexer** (like `tree-sitter` or `ctags`) into the File Router pipeline. After a successful commit, Axiom should automatically re-index the project's symbols, function signatures, and exports. The Orchestrator can then query this local SQLite symbol table to dynamically construct precise `TaskSpecs` without having to read raw project files itself.
+### 2. Validation Sandbox Thrashing (The Cold Start Problem)
 
-### 3. BitNet 1-bit Inference & Structured Output Constraints
+**The Issue:** Section 14.2 (Stage 2) states the engine spawns a validation sandbox with a read-only snapshot, applies the Meeseeks overlay, and runs compilation/tests.
+**The Risk:** Doing a cold boot of a Docker container, copying the project state, and running a full dependency check/compilation (like `npm install` or `go build`) for *every single Meeseeks attempt* will absolutely thrash the user's CPU and disk I/O. If 10 Meeseeks are running and retrying 3 times each, the validation stage becomes a massive bottleneck.
+**Recommendation:** Implement **Warm Sandbox Pools**. The engine should keep a few validation containers running in the background, fully synced to the current `HEAD`. When a Meeseeks finishes, the engine just pushes the file diff via IPC to a warm sandbox, runs the incremental build/test, and clears the diff.
 
-**The Issue:** Section 14 relies on Falcon3 1-bit models for "trivial tasks." While 1-bit models are incredibly fast and cheap, heavy quantization severely degrades a model's ability to strictly adhere to complex JSON schemas, formatting rules, or precise syntax without drifting.
-**The Risk:** The File Router pipeline will likely see a massive spike in automated validation failures (Stage 2) because the BitNet worker output a markdown code block slightly wrong, or hallucinated an extra closing brace, resulting in wasted retry loops.
-**Recommendation:** Axiom must enforce **Grammar Constraints** (e.g., GBNF in llama.cpp) at the inference engine level for the BitNet server. If the task is to output a specific JSON structure or strict Go code, the BitNet server should be physically prevented from generating tokens outside that grammar.
+### 3. The "Test Authorship" Race Condition
 
-### 4. The "Immutable Scope" Reality Check
+**The Issue:** Section 11.5 mandates that test generation tasks are separate from implementation tasks, handled by different model families.
+**The Risk:** If the Implementation Task and the Test Task are siblings in the task tree, they will likely execute concurrently. The Validation Sandbox (Stage 2) requires unit tests to pass. If the Implementation finishes first, it might fail validation because the tests don't exist yet. If the Test task finishes first, it fails because the implementation doesn't exist yet.
+**Recommendation:** Enforce a strict dependency hierarchy for this specific pattern: **Implementation Task → Merge Queue → Test Task**. The implementation must pass *existing* checks and merge to HEAD first. Only then does the Test Meeseeks spawn, pull the new semantic index of the implementation, write the tests, and push them through the validation/merge pipeline.
 
-**The Issue:** Section 2.1 mandates that once the SRS is approved, scope is immutable. If the user realizes it's wrong, they must cancel and start over.
-**The Risk:** In real-world software development, external realities change mid-flight. An API provider's docs might be out of date, or a chosen library might conflict with a requirement. If a worker hits a literal brick wall (e.g., an API endpoint 404s), the task is blocked. If the SRS is strictly immutable, the whole project dies.
-**Recommendation:** Implement an **Engineering Change Order (ECO)** flow. The SRS remains locked to workers, but the Orchestrator can halt the queue, flag the user, and propose an ECO to the SRS. If the user approves the ECO, the Orchestrator updates the SRS, prunes invalidated tasks from the task tree, and resumes. It maintains strictness without being brittle.
+### 4. Semantic Index Sticking
 
-### 5. IPC Polling Overhead
+**The Issue:** Section 17.4 says the semantic index is refreshed after each successful commit in the merge queue.
+**The Risk:** If Task A commits a massive refactor to the `auth` module, Task B (which is currently running in a 30-minute container window) is completely blind to it because it received its TaskSpec *before* Task A committed. Task B will eventually fail at the merge queue (Stage 5), wasting a lot of API budget and time.
+**Recommendation:** Since the engine brokers all lateral communication and inference requests, it could theoretically inject a `context_update` warning into a running Meeseeks' IPC input if the semantic index detects a committed change to symbols the Meeseeks is currently using.
 
-**The Issue:** Section 15.3 states containers will poll `/workspace/ipc/input/` at 500ms intervals.
-**The Risk:** While minor, running 10+ isolated Node.js/Go environments doing filesystem polling every 500ms creates unnecessary CPU overhead on a local machine that is already trying to run local LLM inference and multiple Docker engines.
-**Recommendation:** Swap filesystem polling for local WebSockets, or use `inotify` (via a lightweight filesystem watcher) inside the container so it sleeps until the host touches the file.
+---
 
-
+You have a highly defensible, production-grade architecture blueprint here. The ECO flow alone solves the brittleness that kills most agent workflows.
