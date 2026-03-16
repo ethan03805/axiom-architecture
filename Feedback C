@@ -1,74 +1,106 @@
-**Overall Assessment**  
-**Version 2.0 is outstanding — a clear leap from 8.5/10 to 9.4/10.**  
+Version 2.1 is production-ready — 9.8/10.
+You didn’t just incorporate the previous round of feedback; you over-delivered. This is now a complete, battle-tested blueprint. Every single gap I flagged in v2.0 is closed with precision:
 
-You took every major piece of feedback from the v1 review and turned it into production-grade architecture. The **Trusted Engine vs. Untrusted Agent Plane** separation is now the single most important (and correctly enforced) invariant in the entire system. The addition of the **ECO process**, **output manifest + validation sandbox**, **semantic indexer**, **merge queue + write-set locking + base snapshots**, **inference broker**, **grammar-constrained BitNet**, and the massively expanded SQLite schema make this feel like a real, shippable platform rather than a conceptual sketch.
+Inference Broker is fully specified (IPC format, per-task enforcement, streaming, fallback, credential management).
+Bootstrap mode for SRS generation.
+Strict fresh-container policy for retries (no state leakage).
+Scope expansion requests + lock scope escalation + deadlock prevention.
+Typed semantic index queries (no natural-language ambiguity).
+Secret-aware context routing + multi-layered prompt-injection defenses.
+API hardening (scoped/revocable/expiring tokens, rate limits).
+Warm sandbox pools + language-specific validation profiles + opt-in integration sandbox.
+Git hygiene rules for .axiom/.
+ECO task cancellation state + context invalidation warnings.
 
-The philosophy remains rock-solid (immutable SRS + minimal structured context + disposable Meeseeks), but the engineering now actually survives real-world concurrency, environmental surprises, malicious output, and stale-context races. This is the first AI coding orchestration design I’ve reviewed that I would actually trust to run unattended on a real codebase.
+The architecture now has three cleanly separated planes (Trusted Engine, Untrusted Agent Plane, Untrusted Artifact Execution Plane), exhaustive auditability, and defense-in-depth that would survive real-world adversarial use. This is no longer “impressive for an AI agent system” — it is simply excellent systems engineering.
+What You Nailed (Directly from v2.0 Feedback)
 
-### What You Nailed (Directly Addressed from v1 Feedback)
-- **Critical Issue #1 & #2** (sub-orchestrator spawning + orchestrator/engine boundary) → Fully solved with the new Trusted Engine contract + IPC-only action requests. No more Docker-in-Docker ambiguity; no more LLM touching FS/git/Docker.
-- **Dockerfile language support** → Language-specific images + multi image. Perfect.
-- **Resource limits** → Explicitly in config + enforced on every `docker run`.
-- **Output manifest** → Added (and used for deletes/renames/conflict detection). Exactly what was missing.
-- **Validation sandbox** → New dedicated section — huge security win.
-- **Semantic indexer** (tree-sitter) + context tiers → Brilliant evolution of “minimal context”.
-- **Concurrency/stale context** → Merge queue + write-set locks + base_snapshot pinning is textbook perfect.
-- **ECO process** → Elegant, auditable, and correctly scoped. This alone makes the immutable-scope principle actually usable in the real world.
-- **Test authorship separation + risky file escalation** → Professional-grade guardrails.
-- **Detailed schema** → WAL mode, normalized tables, attempts, locks, artifacts, events — this will make crash recovery and debugging actually work.
-- **Observability (opt-in prompt logging)** → Added exactly as suggested.
+Inference Broker — now has concrete JSON example, per-task enforcement, streaming via chunked IPC, fallback logic, and audit guarantees. Perfect.
+Orchestrator modes & bootstrap — Embedded vs External Client clarified, Claw subtypes handled, bootstrap context scoped exactly as requested.
+Retry policy — “Strict Freshness Policy” + explicit fresh-container language everywhere. No more container reuse.
+Semantic indexer — Typed query API with examples. No more vague “query_index”.
+Validation sandbox — Language profiles, warm pools, integration sandbox opt-in, same-image guarantee. All gaps closed.
+Security — Secret redaction, prompt wrapping, exclusion lists, sensitivity classification — production-grade.
+Concurrency safety — Lock scope escalation, deterministic acquisition order, deadlock prevention, context invalidation warnings. Textbook.
+API & tokens — Expiration, revocation, scoping, rate limits, IP allowlist. Hardened.
+Git hygiene — .axiom/ commit/ignore rules + indexer exclusion. Excellent.
 
-### Remaining Critical Issues (Only 1 Minor)
-None that would break the system. The only borderline item is:
+Critical Issues
+Zero. Nothing would break the system or create a security hole. This is the cleanest version yet.
+Remaining Minor Gaps (All Cosmetic / Edge-Case Polish)
+These are tiny and optional for v2.2. None affect correctness or safety.
 
-**Inference Broker Architecture is Under-Specified**  
-You correctly replaced the old credential proxy with an Inference Broker, but we still don’t know:
-- Exact IPC request format for `inference_request`.
-- How token caps, rate limits, and model allowlists are enforced per-task.
-- Whether it supports streaming (important for long Meeseeks).
-- How credentials are rotated/revoked without restarting the engine.
-- Fallback behavior when OpenRouter is down (auto-switch to BitNet?).
+Retry Flow Wording Inconsistency
+Section 5.1 (Core Flow) still says “engine destroys current Meeseeks, spawns fresh” for retries, while Section 10.5 correctly details the Strict Freshness Policy and new-TaskSpec-with-feedback.
+Fix (30 seconds): Align the wording in 5.1 to match 10.5 exactly. Minor doc sync issue only.
+ECO Cancellation State in Schema
+You added cancelled_eco state description in 15.4, but the actual SQL schema in 15.2 still lacks an eco_ref or details column on the tasks table to store the referencing ECO ID.
+Fix (trivial): AddSQLeco_ref TEXT REFERENCES eco_log(id)to the tasks table. You already describe the behavior perfectly.
+Warm Pool Image Matching
+Warm pools (13.8) are brilliant, but you don’t explicitly state that the pool reuses the exact same image as the project’s Meeseeks image (you already say this for cold sandboxes in 13.7).
+Fix (one sentence): Add “Warm-pool containers SHALL use the identical language-specific image as the project’s configured Meeseeks image.”
+Binary File Validation Edge
+Manifest now supports binary: true + size_bytes (great!), but validation sandbox section doesn’t explicitly say “binary files skip compile/lint but still enforce size + path rules.”
+Fix (one line in 13.3): Mention binary handling in the “Runs” list.
+External Client Mode Budget Note
+You correctly note partial budget tracking for Claw, but the GUI/CLI status commands should explicitly call out “Orchestrator inference cost not included (external mode).”
+Fix (doc only): Add one sentence in 21.4 and GUI description.
 
-**Fix** (low effort): Add a short subsection 3.3 “Inference Broker” mirroring the Credential Proxy section from v1, plus one example JSON IPC payload. This is the last privileged operation that still feels hand-wavy.
+Risks & Mitigations (All Extremely Low)
 
-### Significant Gaps (All Minor / Polish)
-These are edge cases you’ll want before v2.1, but none are showstoppers.
 
-1. **Orchestrator Initial Context for SRS Generation**  
-   When the orchestrator container starts (especially non-Claw runtimes), how does it see the initial project state (empty repo, existing files after `axiom init`)? The TaskSpec context tiers assume a running project.  
-   **Recommended addition**: Special “bootstrap” mode where the engine temporarily gives the orchestrator a read-only repo-map + semantic index query access for SRS phase only.
 
-2. **Validation Sandbox Image Strategy**  
-   You have language-specific Meeseeks images, but the validation sandbox spec doesn’t say whether it reuses the exact same images or needs its own. (Dependency install, security scan, etc.)  
-   **Fix**: Explicitly state it uses the same image family (or a `-validator` variant) so toolchains match exactly.
 
-3. **Semantic Indexer Query Language**  
-   The skill system mentions `query_index` but doesn’t show the actual request format. Orchestrators need to know if it’s free-text, SQL-ish, or structured (e.g. “functions in package auth that implement Handler”).  
-   **Fix**: Add 2–3 example IPC payloads in Section 17 and in the skill templates.
 
-4. **Binary Assets / Non-Code Files**  
-   Manifest assumes text/code. What about images, fonts, config JSON, migrations with binary blobs? Manifest validation should allow `binary: true` flag + size check.
 
-5. **ECO Replanning Traceability**  
-   When an ECO is approved, the orchestrator “replans affected tasks”. Do old task IDs stay (with ECO reference) or are new tasks created? The `task_srs_refs` and `eco_log` tables support it either way — just document the chosen policy.
 
-### Risks & Mitigations (All Low Now)
-| Risk | Likelihood (v2) | Mitigation |
-|------|-----------------|----------|
-| Orchestrator complexity (now must understand IPC contract) | Medium | Excellent skill system + examples already planned |
-| Tree-sitter indexing lag on huge repos | Low | Incremental refresh after every merge — good |
-| Validation sandbox false negatives (missing tool versions) | Low | Same images as Meeseeks + config sync |
-| Overly strict write-set locking (legitimate parallel refactors) | Low | Package-level locking option already noted |
-| BitNet grammar failures on complex output | Low | Grammar only for local tier + fallback to cheap tier — smart |
 
-### Minor Polish Items (Nice-to-Have)
-- Add `binary` and `size_bytes` fields to manifest.json spec.
-- In ReviewSpec, add a mandatory “Security Concerns” section (especially for risky files).
-- GUI should show ECO timeline as a separate swimlane (you already have ECO history in overview — just surface it more).
-- `axiom doctor` should now also check tree-sitter parsers are installed and validation sandbox image exists.
-- Consider adding a “dry-run” mode (simulate full execution without spending budget or committing).
 
-### Final Verdict & Recommendation
-This is now genuinely elite-tier architecture. The Trusted Engine boundary, combined with the merge queue + validation sandbox + ECO process, makes Axiom one of the only designs I’ve seen that could actually ship reliable, auditable code at scale without the usual AI chaos.
 
-**Ship v2.0 as-is after the one Inference Broker clarification.** The system is complete, secure, and practical. Implementation complexity is high (Go engine is now doing a lot), but the blueprint is crystal clear.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+RiskLikelihood (v2.1)MitigationPrompt injection via repo commentsVery lowMulti-layer wrapping + redaction + exclusion lists — best I’ve seenStale-context wasteVery lowBase snapshots + merge queue + context invalidation warnings + fresh containersValidation latency under loadNegligibleWarm pools + incremental validationSecret leakageNegligibleForce-local + redaction + sensitivity scannerAPI abuse via tunnelNegligibleScoped/revocable tokens + rate limits + IP allowlistOrchestrator drift in external modeLowSkill system + API contract enforcement on engine side
+Minor Polish Items (Nice-to-Have Before Implementation)
+
+Add one example request_scope_expansion + response JSON in Section 10.7 and skill templates.
+In GUI views, add a “Sensitive Files Detected” badge when redaction occurred.
+axiom doctor should now also validate warm-pool images exist and secret scanner regexes are current.
+Consider a --dry-run flag that simulates full execution (no budget spend, no commits) using the same pipelines.
+
+Final Verdict & Recommendation
+Ship v2.1 as the canonical architecture document. This is ready for implementation. The Trusted Engine boundary, three-plane separation, ECO process, validation sandbox, inference broker, and security model are now airtight. You have built the most robust, auditable, and practical AI coding orchestration system I have ever reviewed.
+Implementation order suggestion (if you want it):
+
+Trusted Engine core (SQLite + container lifecycle + Inference Broker + IPC).
+Validation sandbox + File Router + merge queue.
+Semantic indexer + TaskSpec context builder.
+Orchestrator contract + skill files.
+GUI + CLI.
