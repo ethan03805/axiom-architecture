@@ -34,8 +34,4 @@ Here is my analysis of the gaps and potential issues in the Axiom architecture:
 **The Risk:** While minor, running 10+ isolated Node.js/Go environments doing filesystem polling every 500ms creates unnecessary CPU overhead on a local machine that is already trying to run local LLM inference and multiple Docker engines.
 **Recommendation:** Swap filesystem polling for local WebSockets, or use `inotify` (via a lightweight filesystem watcher) inside the container so it sleeps until the host touches the file.
 
----
 
-You've built a highly defensible architecture here. The isolation and approval pipelines alone put this ahead of most open-source agent tools currently available.
-
-Would you like to brainstorm solutions for the concurrent execution/git commit race conditions, or would you prefer to dive into how the Orchestrator handles dynamic context extraction via tree-sitter?
