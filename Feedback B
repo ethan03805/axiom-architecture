@@ -1,0 +1,41 @@
+This is an exceptionally well-thought-out architecture document. You’ve directly targeted the most painful failure modes of current agentic coding frameworks: context window degradation (hallucinations), the "misinterpretation loop" of infinite prompt tweaking, and API cost creep. The Dockerized, minimal-context worker approach is exactly the right paradigm to solve these issues.
+
+However, looking at the system flow and state management, there are a few architectural gaps and potential bottlenecks that will likely emerge once you start pushing complex projects through it.
+
+Here is my analysis of the gaps and potential issues in the Axiom architecture:
+
+### 1. The Parallel Execution vs. Serialized Commit Trap (Race Conditions)
+
+**The Issue:** You allow up to 10 concurrent workers (Section 4.2). If Worker A and Worker B are executing in parallel on independent tasks, they both receive `TaskSpecs` based on the *current* state of the project. If Worker A finishes, passes review, and commits to the `axiom/<slug>` branch, the project state has changed. When Worker B finishes 10 seconds later, its output was generated against a stale context.
+**The Risk:** Git might auto-merge cleanly if they touched different files, but *semantic* conflicts will slip through. The Stage 5 Integration Check (Section 11.2) will catch the failure, but reverting Worker B's commit and rerouting the task wastes time and budget on an error caused by the orchestrator's concurrency model, not the worker.
+**Recommendation:** Implement a **Serialized Merge Queue**. Workers can execute and stage files in parallel, but orchestrator validation, commits, and integration checks must be queued and processed serially. Alternatively, generate an AST (Abstract Syntax Tree) hash of the files a worker is meant to touch, and lock those branches of the AST during execution.
+
+### 2. Context Propagation & The Indexing Gap
+
+**The Issue:** Section 8.3 states workers receive "only the specific files and/or code snippets the worker needs." But how does the Orchestrator know *what* those snippets are, especially for code that was just written by another worker 30 seconds ago?
+**The Risk:** If Worker A writes `auth.go` and Worker B needs to write `user_handler.go` which depends on `auth.go`, the Orchestrator needs to accurately slice the newly written `auth.go` to inject into Worker B's `TaskSpec`. LLMs acting as orchestrators are bad at grepping large files reliably to extract context.
+**Recommendation:** Introduce a **Semantic Indexer** (like `tree-sitter` or `ctags`) into the File Router pipeline. After a successful commit, Axiom should automatically re-index the project's symbols, function signatures, and exports. The Orchestrator can then query this local SQLite symbol table to dynamically construct precise `TaskSpecs` without having to read raw project files itself.
+
+### 3. BitNet 1-bit Inference & Structured Output Constraints
+
+**The Issue:** Section 14 relies on Falcon3 1-bit models for "trivial tasks." While 1-bit models are incredibly fast and cheap, heavy quantization severely degrades a model's ability to strictly adhere to complex JSON schemas, formatting rules, or precise syntax without drifting.
+**The Risk:** The File Router pipeline will likely see a massive spike in automated validation failures (Stage 2) because the BitNet worker output a markdown code block slightly wrong, or hallucinated an extra closing brace, resulting in wasted retry loops.
+**Recommendation:** Axiom must enforce **Grammar Constraints** (e.g., GBNF in llama.cpp) at the inference engine level for the BitNet server. If the task is to output a specific JSON structure or strict Go code, the BitNet server should be physically prevented from generating tokens outside that grammar.
+
+### 4. The "Immutable Scope" Reality Check
+
+**The Issue:** Section 2.1 mandates that once the SRS is approved, scope is immutable. If the user realizes it's wrong, they must cancel and start over.
+**The Risk:** In real-world software development, external realities change mid-flight. An API provider's docs might be out of date, or a chosen library might conflict with a requirement. If a worker hits a literal brick wall (e.g., an API endpoint 404s), the task is blocked. If the SRS is strictly immutable, the whole project dies.
+**Recommendation:** Implement an **Engineering Change Order (ECO)** flow. The SRS remains locked to workers, but the Orchestrator can halt the queue, flag the user, and propose an ECO to the SRS. If the user approves the ECO, the Orchestrator updates the SRS, prunes invalidated tasks from the task tree, and resumes. It maintains strictness without being brittle.
+
+### 5. IPC Polling Overhead
+
+**The Issue:** Section 15.3 states containers will poll `/workspace/ipc/input/` at 500ms intervals.
+**The Risk:** While minor, running 10+ isolated Node.js/Go environments doing filesystem polling every 500ms creates unnecessary CPU overhead on a local machine that is already trying to run local LLM inference and multiple Docker engines.
+**Recommendation:** Swap filesystem polling for local WebSockets, or use `inotify` (via a lightweight filesystem watcher) inside the container so it sleeps until the host touches the file.
+
+---
+
+You've built a highly defensible architecture here. The isolation and approval pipelines alone put this ahead of most open-source agent tools currently available.
+
+Would you like to brainstorm solutions for the concurrent execution/git commit race conditions, or would you prefer to dive into how the Orchestrator handles dynamic context extraction via tree-sitter?
