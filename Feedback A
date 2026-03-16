@@ -1,467 +1,417 @@
-Much better.
+I’m checking this revision against the remaining weak spots—authority boundaries, orchestrator modes, validation realism, secret handling, concurrency, API hardening, and git/runtime hygiene—and I’ll call out any contradictions directly.
 
-This is no longer just a good vision doc. It is now a **real architecture** with a clear control plane, safety boundary, and execution model. I would absolutely rather build from this version than v1.
+I’ve narrowed it down to cross-section consistency and enforceability: external Claw mode still conflicts with the “IPC-only/no direct model calls” language, and some budget/logging claims look stronger than that mode can actually support.
 
-My high-level take:
+Thought for 10m 12s
 
-**v1:** promising concept, unsafe in key places.
-**v2:** coherent prototype architecture, with a handful of important design gaps still worth fixing before implementation hardens around them.
+This is the strongest version so far.
 
-## What you fixed well
+I’d call v2.1 the first version that is genuinely alpha-buildable. The big architectural risks from v1 are mostly gone, and most of the important refinements from v2 landed well.
 
-The biggest improvements are exactly the right ones.
+My short verdict:
 
-**1. Trusted Engine vs. Untrusted Agent Plane is the right backbone.**
-Section 4 is the strongest change in the whole document. The “LLMs propose, engine executes” model resolves the authority confusion from v1.
+v1: good idea, unsafe foundation
+v2: solid prototype architecture
+v2.1: strong implementation spec, but not quite spec-frozen
 
-**2. The validation sandbox fixes the most dangerous flaw in the original design.**
-Moving compile/lint/test execution off the host and into a separate sandbox is the single most important safety improvement.
+What got materially better
 
-**3. Base snapshots, write locks, and the merge queue make concurrency believable.**
-This is a major step up from “parallel workers plus hope.” It turns concurrency into an actual controlled system.
+These were the right changes.
 
-**4. The richer schema is much better.**
-Splitting durable tasks from attempts, reviews, validations, artifacts, sessions, and events is the correct move. This is now debuggable and recoverable.
+You resolved most of the earlier ambiguity.
 
-**5. The output manifest is a very good addition.**
-It closes a real gap around delete/rename behavior and gives you a clean surface for scope enforcement and audit.
+External vs embedded orchestrator modes are now explicit.
 
-**6. Test authorship separation and reviewer diversification are good judgment.**
-They do not solve correctness on their own, but they materially reduce the obvious rubber-stamping failure modes.
+The artifact execution plane is separated from the agent plane.
 
-**7. GUI eventing is cleaner now.**
-Moving away from “UI watches SQLite directly” to engine-emitted events is the right architecture.
+Strict freshness for retries now matches your Meeseeks philosophy.
 
-So yes: **this is a serious improvement**. The revised design addresses most of the core criticisms from the first version.
+Scope expansion is a real mechanism instead of an unhandled failure case.
 
-## My updated verdict
+Typed semantic index queries are much better than vague NL lookups.
 
-I would call this:
+Git hygiene and .axiom/ lifecycle are now specified.
 
-**Prototype-ready, not production-ready.**
+Prompt-injection and secret-routing finally moved from slogans into policy.
 
-That is a big compliment. It means the architecture is now strong enough to start building against, but I would still make a v2.1 pass before letting implementation freeze the current assumptions.
+That is a big step up. The doc now has a real control plane, real trust boundaries, and real operational policy.
 
-## The biggest remaining issues
+My updated overall assessment
 
-### 1. Orchestrator deployment is still internally inconsistent
+I would now say:
 
-This is the largest remaining architectural ambiguity.
+Build this, but do one more tightening pass before you treat the architecture as final.
 
-In some places, the orchestrator is:
+The remaining problems are no longer “bad foundation” problems. They are mostly:
 
-* an untrusted Dockerized agent inside the agent plane
+internal consistency issues
 
-In other places, it is:
+one or two correctness gaps
 
-* a remote Claw connected over the API/tunnel
+security hardening details
 
-Those are not the same runtime shape, and they do not have the same trust, cost, logging, or inference behavior.
+schema/spec mismatches
 
-There is also a direct tension between:
+The most important remaining issues
+1. Orchestrator mode is still slightly inconsistent across sections
 
-* “Inference Broker mediates **all** model API calls”
-* “Claw has prior conversational context and may effectively run as the orchestrator”
+You fixed this conceptually, but the doc still says different things in different places.
 
-If the orchestrator is external, then either:
+The biggest examples:
 
-* its inference is **outside** Axiom’s broker, budget, and audit model, or
-* Axiom is not really the thing running the orchestrator.
+8.1 says the orchestrator runs inside a Docker container in the Untrusted Agent Plane.
 
-You need to formalize two orchestrator modes:
+8.2 says external client mode exists, where the orchestrator connects over the API and does its own inference out of band.
 
-**Embedded orchestrator**
+8.6 says the orchestrator interacts with the engine exclusively through IPC and shall not make model API calls directly.
 
-* runs inside Axiom’s untrusted container plane
-* all inference goes through engine broker
-* fully budgeted and audited by Axiom
+Those three statements cannot all be true at once.
 
-**External orchestrator client**
+What you want is probably:
 
-* Claw or similar connects via API
-* inference may be out-of-band
-* Axiom only audits requests/actions, not the orchestrator’s internal reasoning cost
+Embedded orchestrator
 
-Until you define that clearly, Sections 3, 8, and 24 do not fully agree.
+in Docker
 
----
+IPC contract
 
-### 2. Your “local control plane with external inference” statement is still too broad
+no direct provider calls
 
-You fixed the OpenRouter issue, but a new one remains:
+fully budgeted and audited
 
-If Cloudflare Tunnel or remote Claw is enabled, then project data is leaving the machine through services other than model providers.
+External orchestrator
 
-So Section 2.3 is not strictly true as written.
+outside Docker
 
-You should revise it to something like:
+REST/WebSocket contract
 
-* by default, control-plane data stays local
-* external transmission occurs only through explicitly enabled channels:
+may do its own inference
 
-  * model providers
-  * remote-control/tunnel services
-* such transmission is opt-in and auditable
+only engine-side execution is budgeted by Axiom
 
-That matters because right now the document understates the real data egress surface.
+Right now the architecture understands that distinction, but the text still mixes them.
 
----
+Fix: split the orchestrator contract into two subsections: embedded contract and external client contract. Update the high-level diagram too, because it still visually places “Claw/CC/etc” in Docker.
 
-### 3. Reusing the same Meeseeks container for retries conflicts with your disposable-agent principle
+2. The retry model and the approval pipeline still disagree in wording
 
-This is subtle but important.
+You fixed strict freshness in 5.1, 10.5, and 30.1. Good.
 
-You say Meeseeks are disposable, context-bounded, and destroyed after a single purpose.
-But in Section 10.5 and Section 30.1, the same container is reused across revisions.
+But 14.2 still repeatedly says things like:
 
-That reintroduces the very thing you are trying to avoid:
+feedback is delivered to the Meeseeks
 
-* sticky context
-* state leakage
-* prompt accumulation
-* local temp artifacts influencing later behavior
+Meeseeks revises and resubmits
 
-You should choose one of these explicitly:
+That reads like the same worker persists across revision rounds, which is exactly what you no longer want.
 
-**Option A: strict freshness**
+This is mostly editorial now, but it matters because retry behavior is a foundational design choice.
 
-* every retry gets a brand-new container
-* strongest alignment with your philosophy
+Fix: in every reject/fail branch in the pipeline, say:
 
-**Option B: split revisions from retries**
+current Meeseeks is destroyed
 
-* same container allowed for one or two lightweight revision cycles
-* true “retry” or “escalation” always means fresh container
+a fresh Meeseeks is spawned
 
-Right now the doc says “disposable” but behaves “session-persistent.”
+a new TaskSpec is produced containing structured failure history
 
----
+3. The test-generation flow still has a correctness gap
 
-### 4. The validation sandbox is good, but still too optimistic about dependency handling
+This is the biggest remaining design issue.
 
-The safety direction is right. The operational model is not fully there yet.
+You now say in 11.5:
 
-This part is still underspecified:
+implementation task runs
 
-* install dependencies from lockfiles only
-* no network
-* use pre-cached dependencies
+implementation passes existing validation
 
-That is fine in principle, but in real projects you will run into:
+implementation merges
 
-* postinstall scripts
-* toolchain downloads
-* private registries
-* OS package dependencies
-* codegen tools
-* language-specific edge cases
-* tests that assume service availability
+test-generation task runs against committed implementation
 
-So the problem is not the rule. The problem is that the rule needs a more concrete execution model.
+That solves the stale-context problem for test generation, but it creates a new one:
 
-I would define **language-specific validation profiles**:
+the implementation can be committed before the newly generated tests ever exist.
 
-* Node profile
+That means the implementation can pass:
 
-  * `npm ci` or equivalent
-  * ideally with scripts disabled unless explicitly approved
-  * read-only dependency cache
-* Go profile
+compile
 
-  * vendored modules or read-only module cache
-* Python profile
+lint
 
-  * locked wheels / requirements with prebuilt cache
-* Rust profile
+existing tests
 
-  * cargo lock + prefilled registry/cache
+but still fail the new tests once they are created.
 
-And separately, define a third environment for integration tests:
+You need to define what happens then.
 
-**integration sandbox**
+Right now, 14.2 Stage 2 says validation includes “both existing tests and any new tests from separate test tasks,” which conflicts with your own sequencing in 11.5. Those new tests do not exist yet at implementation-validation time.
 
-* opt-in only
-* explicitly scoped secrets
-* explicitly scoped network egress
-* only for projects whose acceptance criteria require live service interaction
+So you need to choose one of these models:
 
-Your current validation sandbox is good for unit/build validation, but not sufficient for real integration-heavy systems.
+Model A: post-merge test discovery
 
----
+implementation merges after passing existing checks
 
-### 5. File-level locks will not be enough for interface drift
+new test task is generated afterward
 
-Write-set locking is a big improvement, but file locks alone only solve the easiest conflict class.
+if those tests fail, Axiom creates a follow-up implementation-fix task
 
-They do **not** solve cases like:
+completion criteria require both implementation and generated tests to converge
 
-* task A changes an exported interface
-* task B changes a downstream implementation in another file
-* neither touches the same file
-* both are still semantically conflicting
+Model B: candidate-snapshot test generation
 
-You partially address this with base snapshots and merge-time checks, but you will still get churn and requeue storms if locking stays purely file-based.
+generate tests against a candidate implementation snapshot before final merge
 
-I would add a second lock type for higher-risk tasks:
+validate both together
 
-* symbol-level or module-level lock
-* exported interface lock
-* package boundary lock
+only then commit
 
-At minimum, if a task touches:
+Either can work. Right now the document says a bit of both.
 
-* public exports
-* interfaces
-* API schemas
-* route contracts
-* database migrations
+This is the main thing I would not leave ambiguous.
 
-then the scheduler should lock at a broader scope than individual files.
+4. Budget guarantees are still too broad for external orchestrators
 
----
+This is much better than v2, but there is still a scope mismatch.
 
-### 6. You need a path for legitimate scope expansion
+You now correctly say in 8.2 that external client mode only gives partial budget tracking. Good.
 
-The manifest and target-file validation are good safety controls.
-But they are currently a little too rigid.
+But earlier design language still implies that Axiom respects the project budget ceiling globally. That is only true for engine-managed spend, not for external orchestrator reasoning spend.
 
-In real work, a Meeseeks may discover it also needs to modify:
+So in external client mode, the true total project cost can exceed the Axiom budget even if Axiom itself stays under budget.
 
-* an import barrel
-* a route registry
-* a shared type file
-* a test fixture
-* a package manifest
+Fix: define two budgets explicitly:
 
-If the engine simply rejects all out-of-scope edits, you will create a lot of unnecessary retries.
+Execution Budget
 
-You need a structured mechanism like:
+enforced by Axiom
 
-* `request_scope_expansion`
-* engine checks whether the new files are reasonable
-* engine acquires extra locks if needed
-* orchestrator can approve or deny the expansion
-* task continues without a full restart
+covers Meeseeks, reviewers, sub-orchestrators, embedded orchestrators
 
-Without that, the system will be safe but frustratingly brittle.
+External Orchestrator Spend
 
----
+not enforceable by Axiom unless the client reports it
 
-### 7. Secret-aware context routing is still missing
+shown as unknown / out-of-band unless integrated
 
-This is one of the biggest remaining safety gaps.
+That makes the contract honest.
 
-The engine is now the only thing that constructs context and sends it to external providers. That is good. But the doc still does not say what happens when relevant files contain:
+5. Secret-aware routing is improved, but “force to BitNet” is too rigid
 
-* API keys
-* secrets in config
-* proprietary prompts
-* customer data
-* internal credentials
-* sensitive comments or runbooks
+This is a smart addition, but the current policy is too narrow:
 
-“No project mount in containers” helps, but it does **not** solve the bigger issue:
-the engine itself may package sensitive snippets into prompts sent to OpenRouter.
+Tasks touching sensitive files SHALL be forced to BitNet local models unless the user explicitly approves external inference.
 
-You need a policy like this:
+That will break down for real sensitive tasks like:
 
-* files are classified by sensitivity
-* secret scan runs before prompt packaging
-* sensitive paths are redacted or blocked from external inference
-* tasks touching sensitive files are forced to local-only models or require explicit user approval
-* prompt logs never store redacted secrets in raw form
+auth systems
 
-Until you do that, the main remaining risk is not container escape. It is **prompt-level data leakage** from the engine.
+cryptographic code
 
----
+complex production config
 
-### 8. Prompt injection is identified, but the mitigation is still too vague
+security refactors
 
-“Prompt sanitization” is the right concept, but it is not yet an architecture.
+Those are often the tasks least suited to a tiny local model.
 
-You need an actual prompt-construction policy for repo-derived content, such as:
+So the right concept is not “force to BitNet.” It is:
 
-* code/comments are always wrapped as untrusted data
-* instruction-like comments are not treated as commands
-* retrieved content includes provenance labels
-* prompt templates explicitly say repository text may contain malicious instructions
-* retrieval excludes `.axiom/`, logs, prompt archives, env files, secrets, and generated internal state
+force to local-only inference class, or require explicit override
 
-Right now you correctly name the threat, but the defense is still slogan-level.
+That local-only class might include:
 
----
+BitNet for trivial sensitive work
 
-### 9. API and tunnel hardening is too light for something that can control the project
+stronger local models if the user has them
 
-Token auth is necessary. It is not enough.
+or human-only/manual mode for high-risk code
 
-If you expose the control plane through a tunnel, I would want at minimum:
+Otherwise the architecture silently trades data safety for code-quality failure.
 
-* token expiration
-* rotation and revocation
-* scoped tokens
-* rate limits
-* audit of failed auth attempts
-* optional IP restrictions or Cloudflare Access
-* explicit warning that remote orchestration may expose project metadata outside the local machine
+6. Your lock model is stronger, but the schema still does not fully represent it
 
-This is especially important because the API is not a read-only surface. It can start, pause, approve, cancel, and drive execution.
+Conceptually, the locking story is now much better. But the schema still lags behind the behavior.
 
----
+Examples:
 
-### 10. `.axiom/` lifecycle and git hygiene need to be specified
+task_target_files has lock_scope, but task_locks still only stores file_path.
 
-This is an operational gap that will matter immediately.
+You now support file/package/module/schema-level locks, but the lock table does not really model a general lock key.
 
-You store in `.axiom/`:
+cancelled_eco references “details” or maybe eco_ref, but neither is actually in the tasks schema.
 
-* database
-* logs
-* prompt captures
-* specs
-* staging
-* ECO records
+Those are not just editorial nits. They are implementation traps.
 
-You need to specify clearly whether `.axiom/` is:
+Fix: normalize the lock resource itself. Something like:
 
-* committed
-* ignored
-* partially committed
-* excluded from indexing
-* excluded from prompt construction
-* excluded from merge diffs
+resource_type = file | package | module | schema
 
-My recommendation:
+resource_key = canonical identifier
 
-* `.axiom/axiom.db`, logs, staging, IPC, prompt logs: **never commit**
-* accepted SRS and ECO records: user choice, but default to **not committed**
-* `.axiom/` excluded from semantic indexing and agent context by default
-* `axiom init` should write a `.gitignore` entry immediately
+task_id
 
-Also add a preflight rule:
+locked_at
 
-* repository must be clean, or
-* Axiom uses a dedicated git worktree
+And either:
 
-That will save you a lot of real-world pain.
+add eco_ref directly to tasks, or
 
-## Medium issues worth cleaning up
+create a separate task lineage / invalidation table
 
-These are not foundational blockers, but I would still tighten them.
+Right now the behavior is richer than the schema.
 
-### The validation sandbox is not really part of the “agent plane”
+7. API/query interfaces are still slightly inconsistent
 
-It is untrusted execution, yes, but it is not an LLM agent. I would consider naming three planes:
+You made the semantic index API typed, which is the right move.
 
-* trusted control plane
-* untrusted agent plane
-* untrusted artifact execution plane
+But a few interfaces still look like older, looser versions:
 
-That makes the trust model clearer.
+17.5 says natural-language queries are not supported.
 
-### Structured index queries would be better than natural-language ones
+27.6 still has axiom index query "<query>", which reads like free-form text.
 
-The semantic index is a good idea, but “query the index” should ideally be a typed API, not vague NL lookup. For example:
+24.2 exposes GET /api/v1/index/query, but your typed API examples look more like structured request bodies.
 
-* `lookup_symbol`
-* `reverse_dependencies`
-* `list_exports`
-* `find_implementations`
-* `module_graph`
+That is easy to fix, but worth fixing. You want one story:
 
-That will be much easier to reason about and test.
+typed CLI flags
 
-### Budget reservation needs pre-authorization semantics
+or JSON stdin / file input
 
-“Reserve 20% for reviews” is directionally good, but a fixed percentage may become too rigid. Also, providers charge after completion, so strict budget enforcement requires either:
+and probably POST rather than GET for structured queries
 
-* pre-reserving a max-token cost ceiling before each request, or
-* hard project-level budget envelopes with in-flight accounting
+8. Warm sandbox pools are useful, but they slightly weaken your isolation story unless tightened
 
-Otherwise “enforced on every request” is fuzzier than it sounds.
+This is not a blocker, but it is the one optimization I would treat carefully.
 
-### The ECO wording is slightly inconsistent
+Pre-warmed validation sandboxes can reduce latency, but they also introduce risk of:
 
-In one place ECOs “modify environmental details within the SRS.”
-In another place the original SRS is preserved and ECOs are versioned addenda.
+state contamination between validations
 
-The addendum model is better. I would standardize on:
+leftover processes
 
-* SRS never changes in place
-* ECOs append to project definition
-* effective requirements = SRS + approved ECOs
+mutated caches
 
-### The `fsevents` note is probably misplaced
+non-hermetic incremental behavior
 
-If your containers are Linux containers, then `inotify` is the relevant mechanism even when the host is macOS. This is small, but I would clean it up.
+You did say overlays are reset, which helps. But I would want explicit guarantees:
 
-### `target_files` as JSON is serviceable but not ideal
+overlay fully discarded each run
 
-You normalized most of the important things. I would probably also normalize file targets/scopes if you expect serious scheduling, scope expansion, or lock conflict queries.
+all child processes reaped
 
-## One more thing: test separation is good, but still not sufficient for high-assurance work
+temp directories recreated
 
-This version does the right thing by separating implementation and test authorship. That is materially better than before.
+periodic full cold validation after N uses
 
-But if both the implementation and the tests are AI-generated, you still do not have a strong independent correctness signal. For normal coding automation, this is acceptable. For security-sensitive or high-risk code, I would add:
+no writable shared cache except intentionally scoped dependency caches
 
-* user-specified acceptance tests where possible
-* golden fixtures
-* property-based tests
-* static policy checks
-* mandatory human review for auth/crypto/infra changes
+Otherwise you slowly erode the clean isolation you worked hard to establish.
 
-You already move in this direction with risky-file escalation. I would just make the philosophy explicit.
+For MVP, I would consider leaving warm pools as an optimization behind a feature flag.
 
-## What I would change next in v2.1
+9. Container hardening is still a little too “default Docker”
 
-If you want the highest-leverage improvements, I would make these next:
+You have:
 
-1. **Define orchestrator modes explicitly**
-   Embedded/containerized vs external/API-driven. Clarify inference ownership, budget ownership, and audit boundaries.
+non-root
 
-2. **Make retry freshness explicit**
-   Either fresh container on every retry, or a clearly limited revision loop distinct from retries.
+no network
 
-3. **Add a secret-aware context policy**
-   Redaction, sensitivity classification, local-only routing for sensitive files, and prompt-log hygiene.
+resource limits
 
-4. **Define hermetic validation profiles per language**
-   Node, Go, Python, Rust, plus a separate opt-in integration sandbox.
+no project mount
 
-5. **Add scope expansion requests**
-   So tasks can safely widen their write-set without failing unnecessarily.
+That is good, but I still think you should add explicit hardening language for both agent containers and validation sandboxes:
 
-6. **Harden containers beyond default Docker isolation**
-   Read-only rootfs, dropped capabilities, `no-new-privileges`, seccomp/AppArmor profile, tmpfs where appropriate.
+read-only root filesystem
 
-7. **Specify `.axiom/` git/indexing rules and clean-worktree behavior**
-   This will matter on day one.
+dropped Linux capabilities
 
-## Bottom line
+no-new-privileges
 
-This is a strong revision.
+seccomp/AppArmor profile
 
-You fixed the major architectural flaws from the first version:
+PID limits
 
-* trust boundary confusion
-* unsafe host-side validation
-* weak task history/state model
-* concurrency naïveté
-* missing file-operation model
+tmpfs for writable scratch dirs where appropriate
 
-What remains is mostly in the category of:
+You are already thinking like a security-first system. This is the missing last mile.
 
-* deployment consistency
-* data egress clarity
-* secret handling
-* operational realism
-* hardened policy details
+10. Root-system Claw “bypass” should probably be collapsed into delegated approval
 
-So my honest assessment is:
+This one is more product-philosophy than hard architecture, but I would still change it.
 
-**v1 needed redesign.
-v2 needs refinement.**
+You currently have both:
 
-If you build against this version, you are unlikely to regret the big architectural choices. The main risk now is not “wrong foundation,” but “insufficiently specified edge policies.”
+srs_approval_delegate = "claw"
 
+claw_srs_bypass = true
+
+That is redundant and a little dangerous. “Bypass” sounds stronger and less auditable than “delegated approval,” while functionally they are very close.
+
+Given your whole philosophy is built around explicit scope lock, I would simplify:
+
+keep delegated approval
+
+drop the separate “bypass” concept
+
+That preserves the trust model more cleanly.
+
+Smaller things I would still tidy
+
+These are lower priority, but worth cleaning up.
+
+2.3 says all transmitted data is logged, but 31 makes payload logging opt-in.
+Better wording: transmission events and metadata are always logged; payload bodies are logged only if observability is enabled.
+
+28.2 says clean working tree “SHOULD” be required.
+I would make that behavior deterministic: either refuse to run on dirty state, or automatically use a dedicated worktree.
+
+Overview still says agents run in isolated Docker containers.
+That is not fully true for external orchestrators. Easy wording fix.
+
+Where I’d place this version
+
+I’d summarize v2.1 like this:
+
+Architecturally strong, operationally close, still worth one final consistency pass.
+
+If you started building from this version, I do not think you’d regret the major design choices. That is the big milestone.
+
+The remaining work is mostly:
+
+making every section tell the same story
+
+closing the test-generation loop
+
+tightening schema alignment
+
+hardening execution containers
+
+My recommended v2.2 punch list
+
+If I were editing this into a near-final architecture doc, I would make these next:
+
+Split orchestrator contract into embedded vs external subsections and update the diagrams.
+
+Rewrite approval-pipeline reject paths to match strict fresh-container retries.
+
+Resolve the implementation-vs-test-generation sequencing and define the post-test-failure loop.
+
+Scope budget language to engine-managed spend in external client mode.
+
+Replace “force to BitNet” with “force to local-only execution class.”
+
+Normalize lock resources and add explicit eco_ref/task-lineage schema support.
+
+Make CLI/API index queries fully typed and consistent.
+
+Add explicit container hardening policy.
+
+Treat warm sandbox pools as optional optimization with reset guarantees.
+
+Remove the separate Claw SRS bypass knob and keep delegated approval only.
+
+So the honest answer is: this is very good now. It reads like a serious system design instead of a smart concept note. The remaining issues are concrete enough that a v2.2 can probably settle most of them.
